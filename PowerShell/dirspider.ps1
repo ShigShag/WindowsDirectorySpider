@@ -107,7 +107,7 @@ function Get-FileMetadata {
                 IsReadOnly     = $file.IsReadOnly
                 ShortcutOrigin = $true
             }
-            
+
             # Convert array to json format
             $jsonString = $metadataList | ConvertTo-Json
     
