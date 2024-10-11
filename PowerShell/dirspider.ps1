@@ -32,17 +32,17 @@
 
 # Script execution starts here
 param (
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$DirectoryPath,
-    [string]$OutputPath = "metadata.json",
+    [string]$OutputPath,
     [string[]]$Include = @(),
     [string[]]$Exclude = @()
 )
 
-if (!$PSBoundParameters.ContainsKey("help")) {
-    Get-Help -Name $PSCmdlet.InvocationName
-    Exit
-}
+# if (!$PSBoundParameters.ContainsKey("help")) {
+#     Get-Help -Name $PSCmdlet.InvocationName
+#     Exit
+# }
 
 
 if (!$PSBoundParameters.ContainsKey("DirectoryPath")) {
@@ -58,20 +58,17 @@ function Get-FileMetadata {
 
     try {
         $file = Get-Item -Path $FilePath
-        $acl = Get-Acl $file.FullName
 
         # Collect metadata for the file
         $metadataList = [PSCustomObject]@{
-            Name           = $file.Name
-            FullPath       = $file.FullName
-            Extension      = $file.Extension
-            Size           = $file.Length
-            CreationTime   = $file.CreationTime
-            LastAccess     = $file.LastAccessTime
-            LastWrite      = $file.LastWriteTime
-            Rights         = $acl.Access | ForEach-Object { $_.FileSystemRights.ToString() }
-            IsReadOnly     = $file.IsReadOnly
-            ShortcutOrigin = $false
+            name          = $file.Name
+            full_path     = $file.FullName
+            extension     = $file.Extension
+            size          = $file.Length
+            creation_time = $file.CreationTime
+            last_access   = $file.LastAccessTime
+            last_write    = $file.LastWriteTime
+            is_read_only  = $file.IsReadOnly
         }
         
         # Convert array to json format
@@ -92,20 +89,17 @@ function Get-FileMetadata {
             $FilePath = $link.TargetPath
 
             $file = Get-Item -Path $FilePath
-            $acl = Get-Acl $file.FullName
 
             # Normal procedure | Mark originated from shortcut
             $metadataList = [PSCustomObject]@{
-                Name           = $file.Name
-                FullPath       = $file.FullName
-                Extension      = $file.Extension
-                Size           = $file.Length
-                CreationTime   = $file.CreationTime
-                LastAccess     = $file.LastAccessTime
-                LastWrite      = $file.LastWriteTime
-                Rights         = $acl.Access | ForEach-Object { $_.FileSystemRights.ToString() }
-                IsReadOnly     = $file.IsReadOnly
-                ShortcutOrigin = $true
+                name          = $file.Name
+                full_path     = $file.FullName
+                extension     = $file.Extension
+                size          = $file.Length
+                creation_time = $file.CreationTime
+                last_access   = $file.LastAccessTime
+                last_write    = $file.LastWriteTime
+                is_read_only  = $file.IsReadOnly
             }
 
             # Convert array to json format

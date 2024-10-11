@@ -1,80 +1,123 @@
-use chrono::{DateTime, Utc};
-use serde::Serialize;
-use std::fs;
+use clap::Parser;
 use std::fs::File;
-use std::fs::Permissions;
-use std::io::{BufWriter, Write};
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::io::BufWriter;
+use std::path::PathBuf;
 use struson::writer::{JsonStreamWriter, JsonWriter};
 use walkdir::WalkDir;
 
-#[derive(Serialize)]
-struct FileMetadata {
-    name: String,
-    path: String,
-    size: u64,
-    created: Option<String>,
-    modified: Option<String>,
-    accessed: Option<String>,
-    owner: Option<u32>,
-    permissions: Option<u32>,
-    file_type: String,
+mod helper;
+mod metadata;
+
+/// Command line argument parser
+#[derive(Parser)]
+struct Args {
+    /// The base directory to start parsing recursively
+    #[arg(short, long)]
+    directory_path: PathBuf,
+
+    /// Output JSON file (default: metadata.json)
+    #[arg(short, long, default_value = "metadata.json")]
+    output_path: PathBuf,
+
+    /// Include these file extensions, comma-separated (e.g., "exe,txt")
+    #[arg(short, long, value_delimiter = ',')]
+    include: Vec<String>,
+
+    /// Exclude these file extensions, comma-separated (e.g., "iso")
+    #[arg(short, long, value_delimiter = ',')]
+    exclude: Vec<String>,
 }
 
-impl FileMetadata {
-    // Extract metadata from a given path
-    fn from_path(path: &Path) -> Option<Self> {
-        let metadata = fs::metadata(path).ok()?;
-        let file_type = if metadata.is_file() {
-            "File".to_string()
-        } else if metadata.is_dir() {
-            "Directory".to_string()
-        } else {
-            "Other".to_string()
+fn walk_path(cli_args: &Args) -> u64 {
+    // Check if path to walk exists
+    if !&cli_args.directory_path.exists() {
+        eprintln!(
+            "Directory path {:?} does not exist or is not a valid directory.",
+            &cli_args.directory_path
+        );
+        return 0;
+    }
+
+    // Create new file | If it fails panic, since continuing doesn't make sense
+    let file = File::create(&cli_args.output_path).expect("Unable to open file");
+
+    // Create a new writer for the file
+    let mut writer = BufWriter::new(file);
+
+    // Pass the write to the json parser
+    let mut json_writer = JsonStreamWriter::new(&mut writer);
+
+    // Begin an array | Same as above, panic if this fails since continuing doesn't make sense
+    json_writer.begin_array().unwrap();
+
+    // Init file counter
+    let mut file_count: u64 = 0;
+
+    // Walk path with walkdir and filter out directories
+    for entry in WalkDir::new(&cli_args.directory_path)
+        .into_iter()
+        .filter_map(|e| e.ok()) // Ignore any errors while reading entries
+        .filter(|e| e.file_type().is_file()) // Keep only files
+        .filter_map(|entry| {
+            let path = entry.path();
+            let extension = path.extension().and_then(|ext| ext.to_str());
+
+            // Determine if we should include or exclude the entry
+            let should_include = cli_args.include.is_empty()
+                || (extension.map_or(false, |ext| cli_args.include.contains(&ext.to_string())));
+
+            let should_exclude =
+                extension.map_or(false, |ext| cli_args.exclude.contains(&ext.to_string()));
+
+            if should_include && !should_exclude {
+                Some(entry)
+            } else {
+                None
+            }
+        })
+    {
+        // Create a serialized metadata entry
+        let serialized_entry = match metadata::FileMetadata::from_fs_metadata(&entry) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("{}", err);
+                continue;
+            }
         };
 
-        Some(FileMetadata {
-            name: path.file_name()?.to_string_lossy().to_string(),
-            path: path.display().to_string(),
-            size: metadata.len(),
-            created: metadata.created().ok().map(|time| format_time(time)),
-            modified: metadata.modified().ok().map(|time| format_time(time)),
-            accessed: metadata.accessed().ok().map(|time| format_time(time)),
-            owner: Some(metadata.uid()),
-            permissions: Some(metadata.permissions().mode()),
-            file_type,
-        })
-    }
-}
-
-// Function to format file times into readable strings
-fn format_time(time: std::time::SystemTime) -> String {
-    let datetime: DateTime<Utc> = time.into();
-    datetime.to_rfc3339()
-}
-
-fn walk_path(base_path: &String) {
-    let file = File::create("metadata.json").expect("Unable to open file");
-    let mut writer = BufWriter::new(file);
-    let mut json_writer = JsonStreamWriter::new(&mut writer);
-    json_writer.begin_array().unwrap();
-    // Walk path with walkdir and filter out directories
-    for entry in WalkDir::new(base_path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    // Only keep non-directories
-    {
-        if let Some(metadata) = FileMetadata::from_path(entry.path()) {
-            json_writer.serialize_value(&metadata).unwrap();
+        // Match the response, failure should not affect other entries, therefore no panic
+        match json_writer.serialize_value(&serialized_entry) {
+            Ok(_) => {
+                // If ok count up
+                file_count += 1
+            }
+            Err(err) => {
+                eprintln!("{}", err);
+            }
         }
     }
-    json_writer.end_array().unwrap();
+
+    // Also escape this error to try and finish the document
+    if let Err(err) = json_writer.end_array() {
+        eprintln!("Error ending JSON array: {}", err);
+    }
+
+    // If this fails :(
     json_writer.finish_document().unwrap();
+
+    // Return file count
+    file_count
 }
 
 fn main() {
-    walk_path(&"./".to_string());
+    let args = Args::parse();
+
+    let file_count = walk_path(&args);
+
+    if file_count > 0 {
+        println!(
+            "Metadata of {} files has been saved to {:?}",
+            file_count, args.output_path
+        );
+    }
 }
