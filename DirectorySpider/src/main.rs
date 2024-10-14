@@ -1,7 +1,9 @@
 use clap::Parser;
+use parselnk::Lnk;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use struson::writer::{JsonStreamWriter, JsonWriter};
 use walkdir::WalkDir;
 
@@ -26,6 +28,10 @@ struct Args {
     /// Exclude these file extensions, comma-separated (e.g., "iso")
     #[arg(short, long, value_delimiter = ',')]
     exclude: Vec<String>,
+
+    /// Follow .lnk files (default: false)
+    #[arg(short, long)]
+    follow_lnk: bool,
 }
 
 fn walk_path(cli_args: &Args) -> u64 {
@@ -53,53 +59,170 @@ fn walk_path(cli_args: &Args) -> u64 {
     // Init file counter
     let mut file_count: u64 = 0;
 
+    // Initialize queue and visited set
+    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    let mut visited_base_paths: HashSet<PathBuf> = HashSet::new();
+
+    // Add the initial base directory to the queue
+    queue.push_back(cli_args.directory_path.clone());
+
     // Walk path with walkdir and filter out directories
-    for entry in WalkDir::new(&cli_args.directory_path)
-        .into_iter()
-        .filter_map(|e| e.ok()) // Ignore any errors while reading entries
-        .filter(|e| e.file_type().is_file()) // Keep only files
-        .filter_map(|entry| {
-            let path = entry.path();
-            let extension = path.extension().and_then(|ext| ext.to_str());
+    while let Some(current_base) = queue.pop_front() {
+        for entry in WalkDir::new(&current_base)
+            .into_iter()
+            .filter_entry(|e| {
+                if e.file_type().is_dir() {
+                    // Check if the directory was a base path which we previously visited | If so skip it
+                    // This will skip the entire directory
+                    let path = e.path();
 
-            // Determine if we should include or exclude the entry
-            let should_include = cli_args.include.is_empty()
-                || (extension.map_or(false, |ext| cli_args.include.contains(&ext.to_string())));
+                    if visited_base_paths.contains(path) {
+                        println!(
+                            "[*] Skipping directory, since already visited: {}",
+                            path.display()
+                        );
+                    }
 
-            let should_exclude =
-                extension.map_or(false, |ext| cli_args.exclude.contains(&ext.to_string()));
+                    !visited_base_paths.contains(path)
+                } else {
+                    // Return true on file
+                    true
+                }
+                // If a file was found just return true
+            })
+            .filter_map(|e| e.ok()) // Ignore any errors while reading entries
+            .filter(|e| e.file_type().is_file()) // Keep only files
+            .filter_map(|entry| {
+                let path = entry.path();
+                let extension = path.extension().and_then(|ext| ext.to_str());
 
-            if should_include && !should_exclude {
-                Some(entry)
-            } else {
-                None
+                // Determine if we should include or exclude the entry
+                let should_include = cli_args.include.is_empty()
+                    || (extension.map_or(false, |ext| cli_args.include.contains(&ext.to_string())));
+
+                let should_exclude =
+                    extension.map_or(false, |ext| cli_args.exclude.contains(&ext.to_string()));
+
+                if should_include && !should_exclude {
+                    Some(entry)
+                } else {
+                    None
+                }
+            })
+        {
+            // Create a serialized metadata entry
+            let serialized_entry = match metadata::FileMetadata::metadata_from_dir_entry(&entry) {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("[!] {}", err);
+                    continue;
+                }
+            };
+
+            // Match the response, failure should not affect other entries, therefore no panic
+            match json_writer.serialize_value(&serialized_entry) {
+                Ok(_) => {
+                    // If ok count up
+                    file_count += 1
+                }
+                Err(err) => {
+                    eprintln!("[!] {}", err);
+                }
             }
-        })
-    {
-        // Create a serialized metadata entry
-        let serialized_entry = match metadata::FileMetadata::from_fs_metadata(&entry) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!("{}", err);
-                continue;
-            }
-        };
 
-        // Match the response, failure should not affect other entries, therefore no panic
-        match json_writer.serialize_value(&serialized_entry) {
-            Ok(_) => {
-                // If ok count up
-                file_count += 1
-            }
-            Err(err) => {
-                eprintln!("{}", err);
+            // Check for .lnk files
+            if serialized_entry.extension.eq("lnk") && cli_args.follow_lnk{
+                // Clone this since this moves it out of context | We may need to use it later
+
+                if serialized_entry
+                    .full_path
+                    .clone()
+                    .to_string_lossy()
+                    .is_empty()
+                {
+                    eprintln!("The full path is empty.");
+                    continue;
+                }
+
+                let path = std::path::Path::new(&serialized_entry.full_path);
+
+                let lnk = match Lnk::try_from(path) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("[!] {:?}", err);
+                        continue;
+                    }
+                };
+
+                if let Some(target) = lnk.link_info.local_base_path {
+                    // Check if the target is a file or directory
+                    let target = Path::new(&target);
+
+                    // Check if the target exists since .lnk files may be outdated
+                    if target.exists() {
+                        // If the target is a file we need the base path for inclusion determination
+                        if target.is_file() {
+                            if let Some(parent) = target.parent() {
+                                // Check if the target path does not include the base path were we started parsing
+                                // If false we can skip the file or folder | If true we should parse it
+                                if !parent.starts_with(cli_args.directory_path.clone()) {
+                                    // Get metadata | Same procedure as with normal files
+                                    let serialized_entry =
+                                        match metadata::FileMetadata::metadata_from_path(target) {
+                                            Ok(value) => value,
+                                            Err(err) => {
+                                                eprintln!("[!] {}", err);
+                                                continue;
+                                            }
+                                        };
+
+                                    // Match the response, failure should not affect other entries, therefore no panic
+                                    match json_writer.serialize_value(&serialized_entry) {
+                                        Ok(_) => {
+                                            // If ok count up
+                                            // println!(
+                                            //     "[*] Got lnk file: {} -> {}",
+                                            //     entry.path().display(),
+                                            //     target.display()
+                                            // );
+
+                                            file_count += 1
+                                        }
+                                        Err(err) => {
+                                            eprintln!("[!] {}", err);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            if !target.starts_with(cli_args.directory_path.clone()) {
+                                // If the .lnk points to a directory we add it to the queue to parse it later
+                                println!(
+                                    "[*] Got lnk directory: {} -> {}",
+                                    entry.path().display(),
+                                    target.display()
+                                );
+                                queue.push_back(target.to_path_buf());
+                            }
+                        }
+                    }
+                } else {
+                    // Print error and continue
+                    // eprintln!(
+                    //     "[!] Failed to resolve the target path from the shortcut (Likely no file or dir): {:?}",
+                    //     serialized_entry.full_path
+                    // );
+                }
             }
         }
+
+        // Mark this base path as already visited
+        visited_base_paths.insert(current_base.clone());
     }
 
     // Also escape this error to try and finish the document
     if let Err(err) = json_writer.end_array() {
-        eprintln!("Error ending JSON array: {}", err);
+        eprintln!("[!] Error ending JSON array: {}", err);
     }
 
     // If this fails :(
@@ -116,7 +239,7 @@ fn main() {
 
     if file_count > 0 {
         println!(
-            "Metadata of {} files has been saved to {:?}",
+            "[+] Metadata of {} files has been saved to {:?}",
             file_count, args.output_path
         );
     }
