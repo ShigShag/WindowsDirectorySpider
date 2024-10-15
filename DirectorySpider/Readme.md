@@ -34,4 +34,3 @@ Options:
 
 * By default this compiles static
 * Do not include dots in extensions
-* Lnk follow is still to be implemented
