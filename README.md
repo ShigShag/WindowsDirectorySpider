@@ -47,8 +47,3 @@ TotalMinutes      : 3,296551425
 TotalSeconds      : 197,7930855
 TotalMilliseconds : 197793,0855
 ```
-
-### TODOS
-
-- Implement `.lnk` traverse for rust and powershell (directory)
-- Powershell one liner

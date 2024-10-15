@@ -12,10 +12,9 @@ PS > cargo build --release
 
 // Binary will be stored in ./target/release/DirectorySpider.exe
 PS > ./target/release/DirectorySpider.exe --help
-
 Command line argument parser
 
-Usage: DirectorySpider.exe [OPTIONS] --directory-path <DIRECTORY_PATH>
+Usage: Win64_DirectorySpider.exe [OPTIONS] --directory-path <DIRECTORY_PATH>
 
 Options:
   -d, --directory-path <DIRECTORY_PATH>
@@ -26,9 +25,10 @@ Options:
           Include these file extensions, comma-separated (e.g., "exe,txt")
   -e, --exclude <EXCLUDE>
           Exclude these file extensions, comma-separated (e.g., "iso")
+  -f, --follow-lnk
+          Follow .lnk files (default: false)
   -h, --help
           Print help
-```
 
 ## Remarks
 
