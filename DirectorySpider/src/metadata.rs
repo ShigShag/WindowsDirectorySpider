@@ -12,11 +12,12 @@ pub struct FileMetadata {
     name: String,
     pub full_path: PathBuf,
     pub extension: String,
-    size: u64,
+    pub(crate) size: u64,
     creation_time: String,
     last_access: String,
     last_write: String,
     is_read_only: bool,
+    pub matched_keywords: Vec<String>,
 }
 
 impl FileMetadata {
@@ -59,6 +60,7 @@ impl FileMetadata {
             last_access: last_access_time_str,
             last_write: last_write_time_str,
             is_read_only: file_is_readonly,
+            matched_keywords: Vec::new(),
         })
     }
 
@@ -97,6 +99,7 @@ impl FileMetadata {
             last_access: last_access_time_str,
             last_write: last_write_time_str,
             is_read_only: file_is_readonly,
+            matched_keywords: Vec::new(),
         })
     }
 }
