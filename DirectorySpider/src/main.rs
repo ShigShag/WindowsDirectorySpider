@@ -2,9 +2,8 @@ use clap::Parser;
 use parselnk::Lnk;
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use struson::writer::{JsonStreamWriter, JsonWriter};
 use walkdir::WalkDir;
 
 mod helper;
@@ -142,9 +141,17 @@ pub struct Args {
     /// Max file size (bytes) scanned for keywords.
     #[arg(long, default_value_t = 10 * 1024 * 1024)]
     pub max_scan_size: u64,
+
+    /// Flush output to disk every N entries (0 = only at end).
+    #[arg(long, default_value_t = 100)]
+    pub flush_every: u64,
 }
 
-fn walk_path(cli_args: &Args, roots: &[PathBuf], scanner: &scanner::KeywordScanner) -> u64 {
+fn walk_path(
+    cli_args: &Args,
+    roots: &[PathBuf],
+    scanner: &scanner::KeywordScanner,
+) -> (u64, std::io::Result<()>) {
     // Validate roots before touching the output file. Skipping every root would otherwise
     // truncate any existing output to `[]` and exit 0 — a silent overwrite on typos.
     let mut valid_roots: Vec<PathBuf> = Vec::with_capacity(roots.len());
@@ -157,23 +164,27 @@ fn walk_path(cli_args: &Args, roots: &[PathBuf], scanner: &scanner::KeywordScann
     }
     if valid_roots.is_empty() {
         eprintln!("[!] No valid paths to scan. Output file left untouched.");
-        return 0;
+        return (0, Ok(()));
     }
 
     // Create new file | If it fails panic, since continuing doesn't make sense
     let file = File::create(&cli_args.output_path).expect("Unable to open file");
 
-    // Create a new writer for the file
+    // Buffered writer for throughput. Flushed periodically below so the file grows
+    // on disk during the scan instead of appearing empty until the very end.
     let mut writer = BufWriter::new(file);
 
-    // Pass the write to the json parser
-    let mut json_writer = JsonStreamWriter::new(&mut writer);
-
-    // Begin an array | Same as above, panic if this fails since continuing doesn't make sense
-    json_writer.begin_array().unwrap();
+    // Open the JSON array manually so we can stream entries one-by-one via
+    // serde_json::to_writer and flush at our own cadence.
+    writer.write_all(b"[").expect("Unable to write to output file");
 
     // Init file counter
     let mut file_count: u64 = 0;
+    let mut first_entry = true;
+
+    // Periodic flush cadence — push buffered bytes to disk every N entries so the
+    // output file grows during the scan instead of appearing empty until the end.
+    let flush_every = cli_args.flush_every;
 
     // Initialize queue and visited set
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
@@ -242,15 +253,15 @@ fn walk_path(cli_args: &Args, roots: &[PathBuf], scanner: &scanner::KeywordScann
                     scanner.scan(&serialized_entry.full_path, serialized_entry.size);
             }
 
-            // Match the response, failure should not affect other entries, therefore no panic
-            match json_writer.serialize_value(&serialized_entry) {
-                Ok(_) => {
-                    // If ok count up
-                    file_count += 1
-                }
-                Err(err) => {
-                    eprintln!("[!] {}", err);
-                }
+            // Write the entry. Failure on a single entry should not abort the scan.
+            if let Err(err) = write_entry(
+                &mut writer,
+                &serialized_entry,
+                &mut first_entry,
+                &mut file_count,
+                flush_every,
+            ) {
+                eprintln!("[!] {}", err);
             }
 
             // Check for .lnk files
@@ -305,21 +316,14 @@ fn walk_path(cli_args: &Args, roots: &[PathBuf], scanner: &scanner::KeywordScann
                                             .scan(&serialized_entry.full_path, serialized_entry.size);
                                     }
 
-                                    // Match the response, failure should not affect other entries, therefore no panic
-                                    match json_writer.serialize_value(&serialized_entry) {
-                                        Ok(_) => {
-                                            // If ok count up
-                                            // println!(
-                                            //     "[*] Got lnk file: {} -> {}",
-                                            //     entry.path().display(),
-                                            //     target.display()
-                                            // );
-
-                                            file_count += 1
-                                        }
-                                        Err(err) => {
-                                            eprintln!("[!] {}", err);
-                                        }
+                                    if let Err(err) = write_entry(
+                                        &mut writer,
+                                        &serialized_entry,
+                                        &mut first_entry,
+                                        &mut file_count,
+                                        flush_every,
+                                    ) {
+                                        eprintln!("[!] {}", err);
                                     }
                                 }
                             }
@@ -349,16 +353,38 @@ fn walk_path(cli_args: &Args, roots: &[PathBuf], scanner: &scanner::KeywordScann
         visited_base_paths.insert(current_base.clone());
     }
 
-    // Also escape this error to try and finish the document
-    if let Err(err) = json_writer.end_array() {
-        eprintln!("[!] Error ending JSON array: {}", err);
+    // Close the JSON array and force a final flush so the file is complete on disk.
+    // Final-write failures are propagated to the caller so it can avoid claiming
+    // success when the on-disk file is truncated or invalid.
+    let finalize = (|| -> std::io::Result<()> {
+        writer.write_all(b"]")?;
+        writer.flush()?;
+        Ok(())
+    })();
+
+    (file_count, finalize)
+}
+
+/// Serialize a single entry into the open JSON array. Handles the comma separator
+/// for all entries after the first, and triggers a periodic flush so readers tailing
+/// the output file see progress during long scans.
+fn write_entry(
+    writer: &mut BufWriter<File>,
+    entry: &metadata::FileMetadata,
+    first_entry: &mut bool,
+    file_count: &mut u64,
+    flush_every: u64,
+) -> std::io::Result<()> {
+    if !*first_entry {
+        writer.write_all(b",")?;
     }
-
-    // If this fails :(
-    json_writer.finish_document().unwrap();
-
-    // Return file count
-    file_count
+    serde_json::to_writer(&mut *writer, entry)?;
+    *first_entry = false;
+    *file_count += 1;
+    if flush_every > 0 && *file_count % flush_every == 0 {
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 /// Merge `-d` entries with `--input-list` file contents.
@@ -413,7 +439,15 @@ fn main() {
         }
     };
 
-    let file_count = walk_path(&args, &roots, &scanner);
+    let (file_count, finalize_result) = walk_path(&args, &roots, &scanner);
+
+    if let Err(err) = finalize_result {
+        eprintln!(
+            "[!] Failed to finalize output {:?}: {} ({} entries written before failure)",
+            args.output_path, err, file_count
+        );
+        std::process::exit(3);
+    }
 
     if file_count > 0 {
         println!(

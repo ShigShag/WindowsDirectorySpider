@@ -43,6 +43,8 @@ Options:
           Case-sensitive keyword/regex matching
       --max-scan-size <MAX_SCAN_SIZE>
           Max file size (bytes) scanned for keywords [default: 10485760]
+      --flush-every <FLUSH_EVERY>
+          Flush output to disk every N entries (0 = only at end) [default: 100]
   -h, --help
           Print help (see more with '--help')
 
@@ -120,6 +122,13 @@ Options:
           Max file size (bytes) scanned for keywords
 
           [default: 10485760]
+
+      --flush-every <FLUSH_EVERY>
+          Flush output to disk every N entries (0 = only at end).
+          Keeps the .json file growing during long scans so progress is
+          visible to tail/watchers. Lower = more visibility, higher I/O.
+
+          [default: 100]
 
   -h, --help
           Print help (see a summary with '-h')
