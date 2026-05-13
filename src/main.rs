@@ -14,7 +14,7 @@ const AFTER_HELP: &str = "\
 Flags fall in 3 groups:
   files in output    -d  -L  -i  -e
   content scan       -k  --keyword-exclude  --max-scan-size
-  search terms       --keywords  --keyword-regex  --case-sensitive
+  search terms       --keywords  --keywords-file  --keyword-regex  --case-sensitive
 
 `-k` takes EXTENSIONS, not keywords. Search terms go in `--keywords`.
 
@@ -37,6 +37,7 @@ Metadata only:
 Literal keyword scan (search terms = --keywords, scope = -k/-i):
   jinx.exe -d C:\\Logs -i txt,log --keywords password,secret,api_key
   jinx.exe -d C:\\src --keywords TODO,FIXME --case-sensitive
+  jinx.exe -d C:\\Users -i txt,log --keywords-file wordlist.txt
 
 Regex scan:
   jinx.exe -d C:\\Users -i txt,csv,log \\
@@ -129,6 +130,10 @@ pub struct Args {
     /// Literal search terms (comma-separated). THIS is the keyword flag.
     #[arg(long, value_delimiter = ',')]
     pub keywords: Vec<String>,
+
+    /// File of newline-separated literal keywords (# and blank lines ignored).
+    #[arg(long)]
+    pub keywords_file: Option<PathBuf>,
 
     /// Regex pattern to search for. Repeat flag for multiple patterns.
     #[arg(long, long_help = KEYWORD_REGEX_LONG)]
@@ -420,11 +425,48 @@ fn collect_roots(args: &Args) -> Result<Vec<PathBuf>, String> {
     Ok(roots)
 }
 
+/// Merge `--keywords` entries with `--keywords-file` file contents.
+/// Dedupes exact matches while preserving first-seen order.
+fn collect_keywords(args: &Args) -> Result<Vec<String>, String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    for k in &args.keywords {
+        if seen.insert(k.clone()) {
+            out.push(k.clone());
+        }
+    }
+
+    if let Some(path) = &args.keywords_file {
+        let contents = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read --keywords-file {}: {}", path.display(), e))?;
+        for raw in contents.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if seen.insert(line.to_string()) {
+                out.push(line.to_string());
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     let roots = match collect_roots(&args) {
         Ok(r) => r,
+        Err(err) => {
+            eprintln!("[!] {}", err);
+            std::process::exit(2);
+        }
+    };
+
+    args.keywords = match collect_keywords(&args) {
+        Ok(k) => k,
         Err(err) => {
             eprintln!("[!] {}", err);
             std::process::exit(2);

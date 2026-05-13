@@ -37,6 +37,8 @@ Options:
           Extensions never scanned (wins over -k)
       --keywords <KEYWORDS>
           Literal search terms (comma-separated). THIS is the keyword flag
+      --keywords-file <KEYWORDS_FILE>
+          File of newline-separated literal keywords (# and blank lines ignored)
       --keyword-regex <KEYWORD_REGEX>
           Regex pattern to search for. Repeat flag for multiple patterns
       --case-sensitive
@@ -51,7 +53,7 @@ Options:
 Flags fall in 3 groups:
   files in output    -d  -L  -i  -e
   content scan       -k  --keyword-exclude  --max-scan-size
-  search terms       --keywords  --keyword-regex  --case-sensitive
+  search terms       --keywords  --keywords-file  --keyword-regex  --case-sensitive
 
 `-k` takes EXTENSIONS, not keywords. Search terms go in `--keywords`.
 
@@ -101,6 +103,9 @@ Options:
       --keywords <KEYWORDS>
           Literal search terms (comma-separated). THIS is the keyword flag
 
+      --keywords-file <KEYWORDS_FILE>
+          File of newline-separated literal keywords (# and blank lines ignored)
+
       --keyword-regex <KEYWORD_REGEX>
           Regex pattern to search for in file contents. Repeat flag for multiple patterns.
 
@@ -143,6 +148,7 @@ Metadata only:
 Literal keyword scan (search terms = --keywords, scope = -k/-i):
    DirectorySpider.exe -d C:\Logs -i txt,log --keywords password,secret,api_key
    DirectorySpider.exe -d C:\src --keywords TODO,FIXME --case-sensitive
+   DirectorySpider.exe -d C:\Users -i txt,log --keywords-file wordlist.txt
 
 Regex scan:
    DirectorySpider.exe -d C:\Users -i txt,csv,log \
