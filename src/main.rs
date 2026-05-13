@@ -11,17 +11,13 @@ mod metadata;
 mod scanner;
 
 const AFTER_HELP: &str = "\
-Flags fall in 3 groups:
-  files in output    -d  -L  -i  -e
-  content scan       -k  --keyword-exclude  --max-scan-size
-  search terms       --keywords  --keywords-file  --keyword-regex  --case-sensitive
-
-`-k` takes EXTENSIONS, not keywords. Search terms go in `--keywords`.
+Note: `-k` takes EXTENSIONS, not keywords. Search terms go in `--keywords`.
 
 Examples:
   jinx.exe -d C:\\Users -i txt,log --keywords password,secret
   jinx.exe -d \\\\fs01\\share -i docx,xlsx -o share.json
   jinx.exe -L roots.txt --keyword-regex \"AKIA[0-9A-Z]{16}\"
+  jinx.exe -d C:\\Logs -i txt,log --keywords password --matches-only
 
 Run `--help` for full docs and more examples.
 ";
@@ -63,6 +59,19 @@ SMB shares (PowerShell, UNC unquoted unless path has spaces):
 
 Follow .lnk shortcuts (may jump to SMB / off-tree targets):
   jinx.exe -d C:\\Users\\Public\\Desktop -f
+
+Matches-only mode (emit only files with hits, include snippet around each match):
+  jinx.exe -d C:\\Logs -i txt,log --keywords password,secret \\
+      --matches-only --context-lines 2 --context-words 6
+
+  Each match in `matches[]` is split into `before` / `match` / `after` exact
+  substrings of the decoded file content. `line` is 1-based; `column` is the
+  1-based BYTE offset of the match start within its line (not character or
+  grapheme — multibyte UTF-8 counts each byte). `before` and `after` preserve
+  original line endings: CRLF files keep their `\\r` bytes. The
+  --max-matches-per-file cap (default 100) bounds `matches[]` per file;
+  `matched_keywords` still lists every distinct needle that matched,
+  independent of the cap.
 ";
 
 const KEYWORD_REGEX_LONG: &str = "\
@@ -87,35 +96,34 @@ Examples:
     after_long_help = AFTER_LONG_HELP,
 )]
 pub struct Args {
+    // === Files in output ===
     /// Root directory. Repeat `-d` for multiple roots.
-    #[arg(short, long)]
+    #[arg(short, long, help_heading = "Files in output")]
     directory_path: Vec<PathBuf>,
 
     /// File of newline-separated roots (# and blank lines ignored).
-    #[arg(short = 'L', long)]
+    #[arg(short = 'L', long, help_heading = "Files in output")]
     input_list: Option<PathBuf>,
 
-    /// Output JSON file.
-    #[arg(short, long, default_value = "metadata.json")]
-    output_path: PathBuf,
-
     /// Include only these extensions (comma-separated).
-    #[arg(short, long, value_delimiter = ',')]
+    #[arg(short, long, value_delimiter = ',', help_heading = "Files in output")]
     include: Vec<String>,
 
     /// Exclude these extensions (comma-separated).
-    #[arg(short, long, value_delimiter = ',')]
+    #[arg(short, long, value_delimiter = ',', help_heading = "Files in output")]
     exclude: Vec<String>,
 
     /// Follow .lnk shortcuts to their targets.
-    #[arg(short, long)]
+    #[arg(short, long, help_heading = "Files in output")]
     follow_lnk: bool,
 
+    // === Content scan scope ===
     /// Extensions to scan for keywords (subset of -i). Takes EXTENSIONS, not search terms.
     #[arg(
         short = 'k',
         long,
         value_delimiter = ',',
+        help_heading = "Content scan scope",
         long_help = "Extensions eligible for content scan, comma-separated.\n\
                      Must be a subset of --include. Empty = scan all in-scope files.\n\
                      Takes EXTENSIONS, not keywords. Search terms go in --keywords.\n\
@@ -124,31 +132,54 @@ pub struct Args {
     pub keyword_include: Vec<String>,
 
     /// Extensions never scanned (wins over -k).
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', help_heading = "Content scan scope")]
     pub keyword_exclude: Vec<String>,
 
+    /// Max file size (bytes) scanned for keywords.
+    #[arg(long, default_value_t = 10 * 1024 * 1024, help_heading = "Content scan scope")]
+    pub max_scan_size: u64,
+
+    // === Search terms ===
     /// Literal search terms (comma-separated). THIS is the keyword flag.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', help_heading = "Search terms")]
     pub keywords: Vec<String>,
 
     /// File of newline-separated literal keywords (# and blank lines ignored).
-    #[arg(long)]
+    #[arg(long, help_heading = "Search terms")]
     pub keywords_file: Option<PathBuf>,
 
     /// Regex pattern to search for. Repeat flag for multiple patterns.
-    #[arg(long, long_help = KEYWORD_REGEX_LONG)]
+    #[arg(long, long_help = KEYWORD_REGEX_LONG, help_heading = "Search terms")]
     pub keyword_regex: Vec<String>,
 
     /// Case-sensitive keyword/regex matching.
-    #[arg(long)]
+    #[arg(long, help_heading = "Search terms")]
     pub case_sensitive: bool,
 
-    /// Max file size (bytes) scanned for keywords.
-    #[arg(long, default_value_t = 10 * 1024 * 1024)]
-    pub max_scan_size: u64,
+    // === Match output ===
+    /// Only emit files that had at least one keyword/regex hit.
+    #[arg(long, help_heading = "Match output")]
+    pub matches_only: bool,
+
+    /// Lines of context above and below each match (0 = matched line only).
+    #[arg(long, default_value_t = 1, help_heading = "Match output")]
+    pub context_lines: usize,
+
+    /// Words of context on the matched line, before and after the match (0 = full same-line prefix/suffix, no word clipping).
+    #[arg(long, default_value_t = 8, help_heading = "Match output")]
+    pub context_words: usize,
+
+    /// Cap on MatchHits emitted per file (0 = unlimited). `matched_keywords` still lists every distinct hit.
+    #[arg(long, default_value_t = 100, help_heading = "Match output")]
+    pub max_matches_per_file: usize,
+
+    // === Output ===
+    /// Output JSON file.
+    #[arg(short, long, default_value = "metadata.json", help_heading = "Output")]
+    output_path: PathBuf,
 
     /// Flush output to disk every N entries (0 = only at end).
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 100, help_heading = "Output")]
     pub flush_every: u64,
 }
 
@@ -254,19 +285,26 @@ fn walk_path(
 
             // Enrich with keyword scan results when in scope
             if scanner.applies_to(&serialized_entry.extension) {
-                serialized_entry.matched_keywords =
-                    scanner.scan(&serialized_entry.full_path, serialized_entry.size);
+                let result = scanner.scan(&serialized_entry.full_path, serialized_entry.size);
+                serialized_entry.matched_keywords = result.keywords;
+                serialized_entry.matches = result.matches;
             }
 
-            // Write the entry. Failure on a single entry should not abort the scan.
-            if let Err(err) = write_entry(
-                &mut writer,
-                &serialized_entry,
-                &mut first_entry,
-                &mut file_count,
-                flush_every,
-            ) {
-                eprintln!("[!] {}", err);
+            // Matches-only mode suppresses *writing* a file with no hits, but must NOT skip the
+            // rest of the iteration — the .lnk-follow block below still has to resolve targets
+            // (a .lnk file itself has no text hit, yet its target may have plenty).
+            let suppress = cli_args.matches_only && serialized_entry.matched_keywords.is_empty();
+            if !suppress {
+                // Write the entry. Failure on a single entry should not abort the scan.
+                if let Err(err) = write_entry(
+                    &mut writer,
+                    &serialized_entry,
+                    &mut first_entry,
+                    &mut file_count,
+                    flush_every,
+                ) {
+                    eprintln!("[!] {}", err);
+                }
             }
 
             // Check for .lnk files
@@ -317,8 +355,16 @@ fn walk_path(
 
                                     // Enrich with keyword scan results when in scope
                                     if scanner.applies_to(&serialized_entry.extension) {
-                                        serialized_entry.matched_keywords = scanner
+                                        let result = scanner
                                             .scan(&serialized_entry.full_path, serialized_entry.size);
+                                        serialized_entry.matched_keywords = result.keywords;
+                                        serialized_entry.matches = result.matches;
+                                    }
+
+                                    if cli_args.matches_only
+                                        && serialized_entry.matched_keywords.is_empty()
+                                    {
+                                        continue;
                                     }
 
                                     if let Err(err) = write_entry(

@@ -8,6 +8,17 @@ use walkdir::DirEntry;
 use super::helper;
 
 #[derive(Serialize)]
+pub struct MatchHit {
+    pub keyword: String,
+    pub line: usize,
+    pub column: usize,
+    pub before: String,
+    #[serde(rename = "match")]
+    pub r#match: String,
+    pub after: String,
+}
+
+#[derive(Serialize)]
 pub struct FileMetadata {
     name: String,
     pub full_path: PathBuf,
@@ -18,6 +29,8 @@ pub struct FileMetadata {
     last_write: String,
     is_read_only: bool,
     pub matched_keywords: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<MatchHit>,
 }
 
 impl FileMetadata {
@@ -61,6 +74,7 @@ impl FileMetadata {
             last_write: last_write_time_str,
             is_read_only: file_is_readonly,
             matched_keywords: Vec::new(),
+            matches: Vec::new(),
         })
     }
 
@@ -100,6 +114,7 @@ impl FileMetadata {
             last_write: last_write_time_str,
             is_read_only: file_is_readonly,
             matched_keywords: Vec::new(),
+            matches: Vec::new(),
         })
     }
 }
