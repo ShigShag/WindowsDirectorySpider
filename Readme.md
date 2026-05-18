@@ -38,6 +38,8 @@ Match output:
           Words of context on the matched line, before and after the match (0 = full same-line prefix/suffix, no word clipping) [default: 8]
       --max-matches-per-file <MAX_MATCHES_PER_FILE>
           Cap on MatchHits emitted per file (0 = unlimited). `matched_keywords` still lists every distinct hit [default: 100]
+      --max-context-line-chars <MAX_CONTEXT_LINE_CHARS>
+          Max characters per emitted context line/segment, not total before/after field size (0 = unlimited) [default: 0]
 
 Output:
   -o, --output-path <OUTPUT_PATH>  Output JSON file [default: metadata.json]
@@ -93,7 +95,7 @@ AutoAdminLogon
 ### Command for share enum
 
 ```bash
-DirectorySpider.exe -L share_list.txt -i txt,log,md,csv,tsv,rtf,ini,cfg,conf,config,xml,yaml,yml,toml,properties,env,json,ps1,psm1,psd1,bat,cmd,sh,bash,zsh,vbs,js,reg,sql,py,rb,php,pl,java,cs,go,rs,ts,bak,old,backup,orig,tmp,docx,xlsx,pptx,pdf --keywords-file keywords.txt --matches-only --context-lines 5 --context-words 0
+DirectorySpider.exe -L share_list.txt -i txt,log,md,csv,tsv,rtf,ini,cfg,conf,config,xml,yaml,yml,toml,properties,env,json,ps1,psm1,psd1,bat,cmd,sh,bash,zsh,vbs,js,reg,sql,py,rb,php,pl,java,cs,go,rs,ts,bak,old,backup,orig,tmp,docx,xlsx,pptx,pdf --keywords-file keywords.txt --matches-only --context-lines 5 --context-words 0 --max-context-line-chars 500
 ```
 
 ## Remarks

@@ -62,16 +62,18 @@ Follow .lnk shortcuts (may jump to SMB / off-tree targets):
 
 Matches-only mode (emit only files with hits, include snippet around each match):
   jinx.exe -d C:\\Logs -i txt,log --keywords password,secret \\
-      --matches-only --context-lines 2 --context-words 6
+      --matches-only --context-lines 2 --context-words 6 \\
+      --max-context-line-chars 500
 
   Each match in `matches[]` is split into `before` / `match` / `after` exact
   substrings of the decoded file content. `line` is 1-based; `column` is the
   1-based BYTE offset of the match start within its line (not character or
   grapheme — multibyte UTF-8 counts each byte). `before` and `after` preserve
-  original line endings: CRLF files keep their `\\r` bytes. The
-  --max-matches-per-file cap (default 100) bounds `matches[]` per file;
-  `matched_keywords` still lists every distinct needle that matched,
-  independent of the cap.
+  original line endings: CRLF files keep their `\\r` bytes.
+  --max-context-line-chars caps each emitted context line/segment while keeping
+  text nearest the match (0 = unlimited). The --max-matches-per-file cap
+  (default 100) bounds `matches[]` per file; `matched_keywords` still lists
+  every distinct needle that matched, independent of the cap.
 ";
 
 const KEYWORD_REGEX_LONG: &str = "\
@@ -173,6 +175,10 @@ pub struct Args {
     #[arg(long, default_value_t = 100, help_heading = "Match output")]
     pub max_matches_per_file: usize,
 
+    /// Max characters per emitted context line/segment, not total before/after field size (0 = unlimited).
+    #[arg(long, default_value_t = 0, help_heading = "Match output")]
+    pub max_context_line_chars: usize,
+
     // === Output ===
     /// Output JSON file.
     #[arg(short, long, default_value = "metadata.json", help_heading = "Output")]
@@ -212,7 +218,9 @@ fn walk_path(
 
     // Open the JSON array manually so we can stream entries one-by-one via
     // serde_json::to_writer and flush at our own cadence.
-    writer.write_all(b"[").expect("Unable to write to output file");
+    writer
+        .write_all(b"[")
+        .expect("Unable to write to output file");
 
     // Init file counter
     let mut file_count: u64 = 0;
@@ -275,7 +283,8 @@ fn walk_path(
             })
         {
             // Create a serialized metadata entry
-            let mut serialized_entry = match metadata::FileMetadata::metadata_from_dir_entry(&entry) {
+            let mut serialized_entry = match metadata::FileMetadata::metadata_from_dir_entry(&entry)
+            {
                 Ok(value) => value,
                 Err(err) => {
                     eprintln!("[!] {}", err);
@@ -308,7 +317,7 @@ fn walk_path(
             }
 
             // Check for .lnk files
-            if serialized_entry.extension.eq("lnk") && cli_args.follow_lnk{
+            if serialized_entry.extension.eq("lnk") && cli_args.follow_lnk {
                 // Clone this since this moves it out of context | We may need to use it later
 
                 if serialized_entry
@@ -355,8 +364,10 @@ fn walk_path(
 
                                     // Enrich with keyword scan results when in scope
                                     if scanner.applies_to(&serialized_entry.extension) {
-                                        let result = scanner
-                                            .scan(&serialized_entry.full_path, serialized_entry.size);
+                                        let result = scanner.scan(
+                                            &serialized_entry.full_path,
+                                            serialized_entry.size,
+                                        );
                                         serialized_entry.matched_keywords = result.keywords;
                                         serialized_entry.matches = result.matches;
                                     }

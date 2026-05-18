@@ -25,7 +25,11 @@ cargo build --release
 # binary: ./target/release/DirectorySpider.exe
 ```
 
-There are no tests in `src/` — `cargo test` runs nothing.
+Unit tests live in `src/` and should be run for the Windows target:
+
+```bash
+cargo test --target x86_64-pc-windows-gnu
+```
 
 ## CLI shape
 
@@ -34,6 +38,7 @@ Flags group into three categories (also printed in `--help`):
 - **files in output**: `-d` (root, repeatable), `-L` (file of newline-separated roots), `-i`/`-e` (include/exclude extensions)
 - **content scan scope**: `-k`/`--keyword-include` (extensions eligible for content scan — *takes extensions, not search terms*), `--keyword-exclude`, `--max-scan-size`
 - **search terms**: `--keywords` (comma-separated literals), `--keywords-file` (newline-separated literals from file), `--keyword-regex` (repeat flag for multiple patterns), `--case-sensitive`
+- **match output**: `--matches-only`, `--context-lines`, `--context-words`, `--max-matches-per-file`, `--max-context-line-chars` (0 = unlimited)
 
 The most common confusion: `-k` looks like it should take keywords but takes *extensions*. Search terms go in `--keywords` / `--keywords-file` / `--keyword-regex`.
 
@@ -51,6 +56,7 @@ The most common confusion: `-k` looks like it should take keywords but takes *ex
 
 - For case-insensitive matching (the default), `literals_lc` is precomputed once and `content.to_lowercase()` runs per file — avoid recomputing the lowercase keyword list per scan.
 - Regex case-insensitivity is implemented by prepending `(?i)` to each pattern before compilation, not via `RegexBuilder`. `--case-sensitive` flips both branches consistently.
+- `--max-context-line-chars` is an opt-in cap for each emitted `before` / `after` context line or same-line segment. It keeps the text nearest the match and leaves the `match` field untouched.
 
 **Safety on missing roots.** `walk_path` validates roots *before* creating the output file. If every root is missing, it returns without truncating any existing output. This avoids the silent-overwrite-to-`[]` footgun on path typos.
 
