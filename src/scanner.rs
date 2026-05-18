@@ -1,3 +1,4 @@
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use regex::{Regex, RegexBuilder};
 use std::collections::HashSet;
 use std::fs;
@@ -12,7 +13,9 @@ pub struct ScanResult {
 }
 
 pub struct KeywordScanner {
-    compiled: Vec<(String, Regex)>,
+    literal_keywords: Vec<String>,
+    literal_matcher: Option<AhoCorasick>,
+    regexes: Vec<(String, Regex)>,
     include_exts: Vec<String>,
     exclude_exts: Vec<String>,
     max_scan_size: u64,
@@ -24,16 +27,36 @@ pub struct KeywordScanner {
 }
 
 impl KeywordScanner {
-    pub fn new(args: &Args) -> Result<Self, regex::Error> {
-        let mut compiled: Vec<(String, Regex)> =
+    pub fn new(args: &Args) -> Result<Self, String> {
+        let mut literal_keywords = Vec::new();
+        let mut literal_matcher = None;
+        let mut regexes: Vec<(String, Regex)> =
             Vec::with_capacity(args.keywords.len() + args.keyword_regex.len());
 
-        for needle in &args.keywords {
-            let pattern = regex::escape(needle);
-            let regex = RegexBuilder::new(&pattern)
-                .case_insensitive(!args.case_sensitive)
-                .build()?;
-            compiled.push((needle.clone(), regex));
+        let literals_can_use_aho = args
+            .keywords
+            .iter()
+            .all(|needle| !needle.is_empty() && (args.case_sensitive || needle.is_ascii()));
+
+        if literals_can_use_aho {
+            literal_keywords = args.keywords.clone();
+            if !literal_keywords.is_empty() {
+                literal_matcher = Some(
+                    AhoCorasickBuilder::new()
+                        .ascii_case_insensitive(!args.case_sensitive)
+                        .build(&literal_keywords)
+                        .map_err(|err| err.to_string())?,
+                );
+            }
+        } else {
+            for needle in &args.keywords {
+                let pattern = regex::escape(needle);
+                let regex = RegexBuilder::new(&pattern)
+                    .case_insensitive(!args.case_sensitive)
+                    .build()
+                    .map_err(|err| err.to_string())?;
+                regexes.push((needle.clone(), regex));
+            }
         }
 
         for pat in &args.keyword_regex {
@@ -42,13 +65,18 @@ impl KeywordScanner {
             } else {
                 format!("(?i){}", pat)
             };
-            compiled.push((pat.clone(), Regex::new(&effective)?));
+            regexes.push((
+                pat.clone(),
+                Regex::new(&effective).map_err(|err| err.to_string())?,
+            ));
         }
 
-        let enabled = !compiled.is_empty();
+        let enabled = literal_matcher.is_some() || !regexes.is_empty();
 
         Ok(KeywordScanner {
-            compiled,
+            literal_keywords,
+            literal_matcher,
+            regexes,
             include_exts: args.keyword_include.clone(),
             exclude_exts: args.keyword_exclude.clone(),
             max_scan_size: args.max_scan_size,
@@ -103,14 +131,61 @@ impl KeywordScanner {
         };
 
         let content = String::from_utf8_lossy(&bytes);
-        let line_starts = compute_line_starts(&content);
-
         let mut keywords: Vec<String> = Vec::new();
         let mut seen_keywords: HashSet<String> = HashSet::new();
         let mut matches: Vec<MatchHit> = Vec::new();
         let cap_unlimited = self.max_matches == 0;
+        let mut line_starts = LazyLineStarts::new();
 
-        for (display, regex) in &self.compiled {
+        if let Some(literal_matcher) = &self.literal_matcher {
+            let mut seen_literals = vec![false; self.literal_keywords.len()];
+            let mut literal_positions = vec![Vec::new(); self.literal_keywords.len()];
+            let mut literal_last_end = vec![0usize; self.literal_keywords.len()];
+
+            for m in literal_matcher.find_overlapping_iter(content.as_ref()) {
+                let pattern_idx = m.pattern().as_usize();
+                if m.start() < literal_last_end[pattern_idx] {
+                    continue;
+                }
+                literal_last_end[pattern_idx] = m.end();
+                seen_literals[pattern_idx] = true;
+                if cap_unlimited || literal_positions[pattern_idx].len() < self.max_matches {
+                    literal_positions[pattern_idx].push((m.start(), m.end()));
+                }
+            }
+
+            for (idx, display) in self.literal_keywords.iter().enumerate() {
+                if seen_literals[idx] && seen_keywords.insert(display.clone()) {
+                    keywords.push(display.clone());
+                }
+
+                for (start, end) in &literal_positions[idx] {
+                    if cap_unlimited || matches.len() < self.max_matches {
+                        matches.push(build_hit(
+                            &content,
+                            line_starts.get(&content),
+                            *start,
+                            *end,
+                            display,
+                            self.context_lines,
+                            self.context_words,
+                            self.max_context_line_chars,
+                        ));
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (display, regex) in &self.regexes {
+            if !cap_unlimited && matches.len() >= self.max_matches {
+                if regex.is_match(&content) && seen_keywords.insert(display.clone()) {
+                    keywords.push(display.clone());
+                }
+                continue;
+            }
+
             for m in regex.find_iter(&content) {
                 if seen_keywords.insert(display.clone()) {
                     keywords.push(display.clone());
@@ -118,7 +193,7 @@ impl KeywordScanner {
                 if cap_unlimited || matches.len() < self.max_matches {
                     matches.push(build_hit(
                         &content,
-                        &line_starts,
+                        line_starts.get(&content),
                         m.start(),
                         m.end(),
                         display,
@@ -126,11 +201,31 @@ impl KeywordScanner {
                         self.context_words,
                         self.max_context_line_chars,
                     ));
+                } else {
+                    break;
                 }
             }
         }
 
         ScanResult { keywords, matches }
+    }
+}
+
+#[derive(Default)]
+struct LazyLineStarts {
+    starts: Option<Vec<usize>>,
+}
+
+impl LazyLineStarts {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get<'a>(&'a mut self, content: &str) -> &'a [usize] {
+        if self.starts.is_none() {
+            self.starts = Some(compute_line_starts(content));
+        }
+        self.starts.as_deref().expect("line starts initialized")
     }
 }
 
@@ -349,7 +444,39 @@ fn clip_chars_from_end(text: &str, max_chars: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_hit, compute_line_starts};
+    use super::{build_hit, compute_line_starts, KeywordScanner};
+    use crate::Args;
+    use clap::Parser;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("directory-spider-scanner-{}-{}", name, suffix))
+    }
+
+    fn scanner_from_args(args: &[&str]) -> KeywordScanner {
+        let args = Args::try_parse_from(args).expect("arguments parse");
+        KeywordScanner::new(&args).expect("scanner builds")
+    }
+
+    fn scan_fixture(
+        name: &str,
+        content: &str,
+        scanner: &KeywordScanner,
+    ) -> crate::scanner::ScanResult {
+        let root = unique_temp_dir(name);
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let path = root.join("fixture.txt");
+        fs::write(&path, content).expect("write fixture");
+        let result = scanner.scan(&path, content.len() as u64);
+        fs::remove_dir_all(root).expect("remove fixture directory");
+        result
+    }
 
     fn hit_for_options(
         content: &str,
@@ -378,6 +505,96 @@ mod tests {
         max_context_line_chars: usize,
     ) -> crate::metadata::MatchHit {
         hit_for_options(content, needle, 1, 0, max_context_line_chars)
+    }
+
+    #[test]
+    fn literal_scan_reports_all_keywords_after_match_cap_is_full() {
+        let scanner = scanner_from_args(&[
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "alpha,beta,gamma",
+            "--max-matches-per-file",
+            "1",
+        ]);
+
+        let result = scan_fixture("literal-cap-keywords", "alpha beta gamma", &scanner);
+
+        assert_eq!(result.keywords, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].keyword, "alpha");
+        assert_eq!(result.matches[0].r#match, "alpha");
+    }
+
+    #[test]
+    fn literal_scan_keeps_non_overlapping_matches_for_same_keyword() {
+        let scanner = scanner_from_args(&[
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "aa",
+            "--case-sensitive",
+        ]);
+
+        let result = scan_fixture("literal-non-overlap", "aaaa", &scanner);
+
+        assert_eq!(result.keywords, vec!["aa"]);
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].column, 1);
+        assert_eq!(result.matches[1].column, 3);
+    }
+
+    #[test]
+    fn literal_scan_preserves_cross_keyword_overlap() {
+        let scanner = scanner_from_args(&[
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "dog,doghouse",
+            "--case-sensitive",
+        ]);
+
+        let result = scan_fixture("literal-cross-overlap", "doghouse", &scanner);
+
+        assert_eq!(result.keywords, vec!["dog", "doghouse"]);
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].keyword, "dog");
+        assert_eq!(result.matches[1].keyword, "doghouse");
+    }
+
+    #[test]
+    fn literal_scan_keeps_existing_case_insensitive_context_shape() {
+        let scanner = scanner_from_args(&[
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "secret,token",
+            "--context-lines",
+            "1",
+            "--context-words",
+            "0",
+            "--max-context-line-chars",
+            "20",
+        ]);
+
+        let result = scan_fixture(
+            "literal-context-shape",
+            "above line\nprefix SECRET suffix\nbelow line\n",
+            &scanner,
+        );
+
+        assert_eq!(result.keywords, vec!["secret"]);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].keyword, "secret");
+        assert_eq!(result.matches[0].line, 2);
+        assert_eq!(result.matches[0].column, 8);
+        assert_eq!(result.matches[0].before, "above line\nprefix ");
+        assert_eq!(result.matches[0].r#match, "SECRET");
+        assert_eq!(result.matches[0].after, " suffix\nbelow line\n");
     }
 
     #[test]

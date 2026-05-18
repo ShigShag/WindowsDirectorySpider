@@ -20,12 +20,18 @@ pub struct MatchHit {
 }
 
 impl MatchHit {
-    pub fn replace_context_with_hashes(&mut self, index: &mut crate::context_index::ContextIndex) {
-        self.before_hash = Some(index.insert(&self.before));
-        self.after_hash = Some(index.insert(&self.after));
+    pub fn replace_context_with_hashes(
+        &mut self,
+        index: &mut crate::context_index::ContextIndex,
+    ) -> bool {
+        let (before_hash, before_inserted) = index.insert_with_status(&self.before);
+        let (after_hash, after_inserted) = index.insert_with_status(&self.after);
+        self.before_hash = Some(before_hash);
+        self.after_hash = Some(after_hash);
         debug_assert!(self.before_hash.is_some() && self.after_hash.is_some());
         self.before.clear();
         self.after.clear();
+        before_inserted || after_inserted
     }
 }
 

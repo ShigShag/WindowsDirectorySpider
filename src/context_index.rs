@@ -3,8 +3,7 @@ use base64::Engine;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::metadata::MatchHit;
@@ -21,18 +20,26 @@ impl ContextIndex {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn insert(&mut self, value: &str) -> String {
-        let key = hash_context(value);
-        self.values
-            .entry(key.clone())
-            .or_insert_with(|| value.to_string());
-        key
+        self.insert_with_status(value).0
     }
 
-    pub fn replace_match_contexts(&mut self, matches: &mut [MatchHit]) {
-        for hit in matches {
-            hit.replace_context_with_hashes(self);
+    pub(crate) fn insert_with_status(&mut self, value: &str) -> (String, bool) {
+        let key = hash_context(value);
+        let inserted = !self.values.contains_key(&key);
+        if inserted {
+            self.values.insert(key.clone(), value.to_string());
         }
+        (key, inserted)
+    }
+
+    pub fn replace_match_contexts(&mut self, matches: &mut [MatchHit]) -> bool {
+        let mut changed = false;
+        for hit in matches {
+            changed |= hit.replace_context_with_hashes(self);
+        }
+        changed
     }
 
     #[cfg(test)]
@@ -40,15 +47,18 @@ impl ContextIndex {
         self.values.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
     pub fn write_to_path(&self, path: &Path) -> std::io::Result<()> {
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, self)?;
-        writer.flush()
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut tempfile = tempfile::Builder::new()
+            .prefix(".context-index-")
+            .suffix(".partial")
+            .tempfile_in(parent)?;
+        serde_json::to_writer(tempfile.as_file_mut(), self)?;
+        tempfile.as_file_mut().flush()?;
+        tempfile.persist(path).map(|_| ()).map_err(|err| err.error)
     }
 }
 
@@ -86,7 +96,17 @@ pub fn default_context_index_path(output_path: &Path) -> PathBuf {
 mod tests {
     use super::{default_context_index_path, ContextIndex, ALGORITHM};
     use serde_json::Value;
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("directory-spider-{}-{}", name, suffix))
+    }
 
     #[test]
     fn duplicate_context_values_reuse_one_compact_hash() {
@@ -127,6 +147,34 @@ mod tests {
     }
 
     #[test]
+    fn write_to_path_cleans_temporary_file_after_persist_failure() {
+        let base = unique_temp_dir("sidecar-persist-failure");
+        fs::create_dir_all(&base).expect("create fixture directory");
+        let target = base.join("context-index.json");
+        fs::create_dir(&target).expect("create directory at target path");
+        let mut index = ContextIndex::new();
+        index.insert("context");
+
+        let err = index
+            .write_to_path(&target)
+            .expect_err("cannot persist over directory");
+
+        assert!(
+            err.kind() == std::io::ErrorKind::AlreadyExists
+                || err.kind() == std::io::ErrorKind::PermissionDenied
+        );
+        let entries: Vec<_> = fs::read_dir(&base)
+            .expect("read fixture directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("context-index.json")]
+        );
+        fs::remove_dir_all(base).expect("remove fixture directory");
+    }
+
+    #[test]
     fn hashing_match_contexts_dedupes_repeated_contexts() {
         let mut index = ContextIndex::new();
         let mut hits = vec![
@@ -156,6 +204,37 @@ mod tests {
 
         assert_eq!(hits[0].before_hash, hits[1].before_hash);
         assert_eq!(hits[0].after_hash, hits[1].after_hash);
+        assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn hashing_match_contexts_reports_only_new_index_values() {
+        let mut index = ContextIndex::new();
+        let mut first_hits = vec![crate::metadata::MatchHit {
+            keyword: "secret".to_string(),
+            line: 1,
+            column: 8,
+            before: "same before ".to_string(),
+            r#match: "secret".to_string(),
+            after: " same after".to_string(),
+            before_hash: None,
+            after_hash: None,
+        }];
+        let mut repeated_hits = vec![crate::metadata::MatchHit {
+            keyword: "secret".to_string(),
+            line: 2,
+            column: 8,
+            before: "same before ".to_string(),
+            r#match: "secret".to_string(),
+            after: " same after".to_string(),
+            before_hash: None,
+            after_hash: None,
+        }];
+
+        assert!(index.replace_match_contexts(&mut first_hits));
+        assert!(!index.replace_match_contexts(&mut repeated_hits));
+        assert_eq!(first_hits[0].before_hash, repeated_hits[0].before_hash);
+        assert_eq!(first_hits[0].after_hash, repeated_hits[0].after_hash);
         assert_eq!(index.len(), 2);
     }
 

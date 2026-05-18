@@ -83,10 +83,13 @@ Deduplicate large context snippets with a sidecar hash index:
   every distinct needle that matched, independent of the cap.
   --hash-context-lines works with or without --matches-only. It replaces
   `before` / `after` with `before_hash` / `after_hash` keys for emitted
-  matches and writes a sidecar index mapping compact BLAKE3-128 base64url
-  hashes to the original context text. If --context-index-path is omitted,
-  the sidecar path is derived from --output-path. No sidecar is written when
-  no context values are indexed.
+  matches and updates a sidecar index during the scan, before emitting entries
+  that reference newly indexed context. The sidecar maps compact BLAKE3-128
+  base64url hashes to the original context text. If --context-index-path is
+  omitted, the sidecar path is derived from --output-path. Valid zero-match
+  hash-mode scans leave an empty sidecar index. The sidecar is rewritten as a
+  full JSON snapshot whenever a new context value is indexed, so non-repetitive
+  corpora trade extra write traffic for crash/tail-reader decodability.
 ";
 
 const KEYWORD_REGEX_LONG: &str = "\
@@ -192,7 +195,7 @@ pub struct Args {
     #[arg(long, default_value_t = 0, help_heading = "Match output")]
     pub max_context_line_chars: usize,
 
-    /// Replace repeated match context text with compact hashes; see --context-index-path.
+    /// Replace repeated match context text with compact hashes and update --context-index-path during the scan.
     #[arg(long, help_heading = "Match output")]
     pub hash_context_lines: bool,
 
@@ -201,7 +204,7 @@ pub struct Args {
     #[arg(short, long, default_value = "metadata.json", help_heading = "Output")]
     output_path: PathBuf,
 
-    /// Output path for the sidecar context hash index used by --hash-context-lines.
+    /// Output path for the sidecar context hash index updated by --hash-context-lines.
     #[arg(long, help_heading = "Output")]
     context_index_path: Option<PathBuf>,
 
@@ -257,6 +260,14 @@ fn walk_path(
     let mut context_index = cli_args
         .hash_context_lines
         .then(context_index::ContextIndex::new);
+    let context_index_path = context_index
+        .as_ref()
+        .map(|_| cli_args.resolved_context_index_path());
+    if let (Some(index), Some(path)) = (context_index.as_ref(), context_index_path.as_deref()) {
+        if let Err(err) = write_context_index_snapshot(index, path) {
+            return (0, Err(err));
+        }
+    }
 
     // Periodic flush cadence — push buffered bytes to disk every N entries so the
     // output file grows during the scan instead of appearing empty until the end.
@@ -329,25 +340,31 @@ fn walk_path(
                 let result = scanner.scan(&serialized_entry.full_path, serialized_entry.size);
                 serialized_entry.matched_keywords = result.keywords;
                 serialized_entry.matches = result.matches;
-                if let Some(index) = context_index.as_mut() {
-                    index.replace_match_contexts(&mut serialized_entry.matches);
-                }
             }
+            let context_index_changed = if let Some(index) = context_index.as_mut() {
+                index.replace_match_contexts(&mut serialized_entry.matches)
+            } else {
+                false
+            };
 
             // Matches-only mode suppresses *writing* a file with no hits, but must NOT skip the
             // rest of the iteration — the .lnk-follow block below still has to resolve targets
             // (a .lnk file itself has no text hit, yet its target may have plenty).
             let suppress = cli_args.matches_only && serialized_entry.matched_keywords.is_empty();
             if !suppress {
-                // Write the entry. Failure on a single entry should not abort the scan.
-                if let Err(err) = write_entry(
+                match emit_entry(
                     &mut writer,
                     &serialized_entry,
+                    context_index_changed,
+                    context_index.as_ref(),
+                    context_index_path.as_deref(),
                     &mut first_entry,
                     &mut file_count,
                     flush_every,
                 ) {
-                    eprintln!("[!] {}", err);
+                    Ok(()) => {}
+                    Err(EmitEntryError::ContextIndex(err)) => return (file_count, Err(err)),
+                    Err(EmitEntryError::Output(err)) => eprintln!("[!] {}", err),
                 }
             }
 
@@ -405,12 +422,14 @@ fn walk_path(
                                         );
                                         serialized_entry.matched_keywords = result.keywords;
                                         serialized_entry.matches = result.matches;
-                                        if let Some(index) = context_index.as_mut() {
-                                            index.replace_match_contexts(
-                                                &mut serialized_entry.matches,
-                                            );
-                                        }
                                     }
+                                    let context_index_changed = if let Some(index) =
+                                        context_index.as_mut()
+                                    {
+                                        index.replace_match_contexts(&mut serialized_entry.matches)
+                                    } else {
+                                        false
+                                    };
 
                                     if cli_args.matches_only
                                         && serialized_entry.matched_keywords.is_empty()
@@ -418,14 +437,23 @@ fn walk_path(
                                         continue;
                                     }
 
-                                    if let Err(err) = write_entry(
+                                    match emit_entry(
                                         &mut writer,
                                         &serialized_entry,
+                                        context_index_changed,
+                                        context_index.as_ref(),
+                                        context_index_path.as_deref(),
                                         &mut first_entry,
                                         &mut file_count,
                                         flush_every,
                                     ) {
-                                        eprintln!("[!] {}", err);
+                                        Ok(()) => {}
+                                        Err(EmitEntryError::ContextIndex(err)) => {
+                                            return (file_count, Err(err));
+                                        }
+                                        Err(EmitEntryError::Output(err)) => {
+                                            eprintln!("[!] {}", err)
+                                        }
                                     }
                                 }
                             }
@@ -458,45 +486,68 @@ fn walk_path(
     // Close the JSON array and force a final flush so the file is complete on disk.
     // Final-write failures are propagated to the caller so it can avoid claiming
     // success when the on-disk file is truncated or invalid.
-    let context_index_path = context_index
-        .as_ref()
-        .map(|_| cli_args.resolved_context_index_path());
-    let finalize = (|| -> std::io::Result<()> {
-        finalize_output_files(
-            &mut writer,
-            context_index.as_ref(),
-            context_index_path.as_deref(),
-        )
-    })();
+    let finalize = finalize_output_files(&mut writer);
 
     (file_count, finalize)
 }
 
-fn finalize_output_files<W: Write>(
+fn finalize_output_files<W: Write>(writer: &mut W) -> std::io::Result<()> {
+    writer.write_all(b"]")?;
+    writer.flush()
+}
+
+fn write_context_index_snapshot(
+    index: &context_index::ContextIndex,
+    path: &Path,
+) -> std::io::Result<()> {
+    index.write_to_path(path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("failed to write context index {}: {}", path.display(), err),
+        )
+    })
+}
+
+#[derive(Debug)]
+enum EmitEntryError {
+    ContextIndex(io::Error),
+    Output(io::Error),
+}
+
+impl std::fmt::Display for EmitEntryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmitEntryError::ContextIndex(err) | EmitEntryError::Output(err) => {
+                write!(formatter, "{}", err)
+            }
+        }
+    }
+}
+
+fn emit_entry<W: Write>(
     writer: &mut W,
+    entry: &metadata::FileMetadata,
+    context_index_changed: bool,
     context_index: Option<&context_index::ContextIndex>,
     context_index_path: Option<&Path>,
-) -> std::io::Result<()> {
-    if let (Some(index), Some(path)) = (context_index, context_index_path) {
-        if !index.is_empty() {
-            index.write_to_path(path).map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!("failed to write context index {}: {}", path.display(), err),
-                )
-            })?;
+    first_entry: &mut bool,
+    file_count: &mut u64,
+    flush_every: u64,
+) -> Result<(), EmitEntryError> {
+    if context_index_changed {
+        if let (Some(index), Some(path)) = (context_index, context_index_path) {
+            write_context_index_snapshot(index, path).map_err(EmitEntryError::ContextIndex)?;
         }
     }
 
-    writer.write_all(b"]")?;
-    writer.flush()
+    write_entry(writer, entry, first_entry, file_count, flush_every).map_err(EmitEntryError::Output)
 }
 
 /// Serialize a single entry into the open JSON array. Handles the comma separator
 /// for all entries after the first, and triggers a periodic flush so readers tailing
 /// the output file see progress during long scans.
-fn write_entry(
-    writer: &mut BufWriter<File>,
+fn write_entry<W: Write>(
+    writer: &mut W,
     entry: &metadata::FileMetadata,
     first_entry: &mut bool,
     file_count: &mut u64,
@@ -639,7 +690,7 @@ fn main() {
     let scanner = match scanner::KeywordScanner::new(&args) {
         Ok(s) => s,
         Err(err) => {
-            eprintln!("[!] Invalid regex: {}", err);
+            eprintln!("[!] Failed to build keyword scanner: {}", err);
             std::process::exit(2);
         }
     };
@@ -666,10 +717,20 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{finalize_output_files, validate_output_paths, Args};
+    use super::{emit_entry, validate_output_paths, walk_path, Args};
     use clap::Parser;
+    use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("directory-spider-{}-{}", name, suffix))
+    }
 
     #[test]
     fn hash_context_lines_flag_enables_default_sidecar_path() {
@@ -774,30 +835,220 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_failure_leaves_main_json_unclosed() {
-        let mut writer = Vec::from(&b"["[..]);
-        let mut index = crate::context_index::ContextIndex::new();
-        index.insert("context");
-        let sidecar_path = std::env::temp_dir();
+    fn hash_mode_writes_empty_sidecar_for_zero_context_scan() {
+        let root = unique_temp_dir("empty-sidecar");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("notes.txt"), "no searched content").expect("write fixture file");
+        let output_path = root.join("metadata.json");
+        let sidecar_path = root.join("metadata.context-index.json");
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            root.to_str().expect("temp path is utf-8"),
+            "-o",
+            output_path.to_str().expect("output path is utf-8"),
+            "--hash-context-lines",
+            "--context-index-path",
+            sidecar_path.to_str().expect("sidecar path is utf-8"),
+        ])
+        .expect("arguments parse");
+        let scanner = crate::scanner::KeywordScanner::new(&args).expect("scanner builds");
 
-        let err = finalize_output_files(&mut writer, Some(&index), Some(&sidecar_path))
-            .expect_err("directory path cannot be created as a sidecar file");
+        let (_file_count, result) = walk_path(&args, &[root.clone()], &scanner);
 
-        assert!(err.to_string().contains("failed to write context index"));
-        assert_eq!(String::from_utf8(writer).unwrap(), "[");
+        result.expect("scan finalizes");
+        let sidecar = fs::read_to_string(&sidecar_path).expect("sidecar exists during scan");
+        let sidecar: Value = serde_json::from_str(&sidecar).expect("sidecar is valid json");
+        assert_eq!(sidecar["algorithm"], crate::context_index::ALGORITHM);
+        assert_eq!(
+            sidecar["values"]
+                .as_object()
+                .expect("values is an object")
+                .len(),
+            0
+        );
+        fs::remove_dir_all(root).expect("remove fixture directory");
     }
 
     #[test]
-    fn empty_context_index_does_not_write_sidecar() {
+    fn hash_mode_sidecar_init_failure_leaves_main_json_unclosed() {
+        let root = unique_temp_dir("sidecar-init-failure");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("notes.txt"), "secret context").expect("write fixture file");
+        let output_path = root.join("metadata.json");
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            root.to_str().expect("temp path is utf-8"),
+            "-o",
+            output_path.to_str().expect("output path is utf-8"),
+            "--keywords",
+            "secret",
+            "--hash-context-lines",
+            "--context-index-path",
+            root.to_str().expect("temp path is utf-8"),
+        ])
+        .expect("arguments parse");
+        let scanner = crate::scanner::KeywordScanner::new(&args).expect("scanner builds");
+
+        let (_file_count, result) = walk_path(&args, &[root.clone()], &scanner);
+
+        let err = result.expect_err("directory path cannot be sidecar file");
+        assert!(err.to_string().contains("failed to write context index"));
+        let main_output = fs::read_to_string(&output_path).expect("main output was opened");
+        assert_eq!(main_output, "[");
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn hash_mode_updates_sidecar_with_match_contexts_during_scan() {
+        let base = unique_temp_dir("sidecar-live-update");
+        let root = base.join("input");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("notes.txt"), "before secret after").expect("write fixture file");
+        let output_path = base.join("metadata.json");
+        let sidecar_path = base.join("metadata.context-index.json");
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            root.to_str().expect("temp path is utf-8"),
+            "-o",
+            output_path.to_str().expect("output path is utf-8"),
+            "--keywords",
+            "secret",
+            "--matches-only",
+            "--hash-context-lines",
+            "--context-index-path",
+            sidecar_path.to_str().expect("sidecar path is utf-8"),
+        ])
+        .expect("arguments parse");
+        let scanner = crate::scanner::KeywordScanner::new(&args).expect("scanner builds");
+
+        let (_file_count, result) = walk_path(&args, &[root.clone()], &scanner);
+
+        result.expect("scan finalizes");
+        let output: Value =
+            serde_json::from_str(&fs::read_to_string(&output_path).expect("main output exists"))
+                .expect("main output is valid json");
+        let sidecar: Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar_path).expect("sidecar exists"))
+                .expect("sidecar is valid json");
+        let hit = &output[0]["matches"][0];
+        let before_hash = hit["before_hash"].as_str().expect("before hash exists");
+        let after_hash = hit["after_hash"].as_str().expect("after hash exists");
+        assert!(hit.get("before").is_none());
+        assert!(hit.get("after").is_none());
+        assert_eq!(
+            sidecar["values"][before_hash],
+            Value::String("before ".to_string())
+        );
+        assert_eq!(
+            sidecar["values"][after_hash],
+            Value::String(" after".to_string())
+        );
+        fs::remove_dir_all(base).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn emit_entry_does_not_write_hash_entry_when_sidecar_snapshot_fails() {
+        let base = unique_temp_dir("sidecar-emit-failure");
+        fs::create_dir_all(&base).expect("create fixture directory");
+        let file_path = base.join("notes.txt");
+        fs::write(&file_path, "before secret after").expect("write fixture file");
+        let mut entry =
+            crate::metadata::FileMetadata::metadata_from_path(&file_path).expect("metadata builds");
+        entry.matched_keywords = vec!["secret".to_string()];
+        entry.matches = vec![crate::metadata::MatchHit {
+            keyword: "secret".to_string(),
+            line: 1,
+            column: 8,
+            before: "before ".to_string(),
+            r#match: "secret".to_string(),
+            after: " after".to_string(),
+            before_hash: None,
+            after_hash: None,
+        }];
+        let mut index = crate::context_index::ContextIndex::new();
+        let changed = index.replace_match_contexts(&mut entry.matches);
         let mut writer = Vec::from(&b"["[..]);
-        let index = crate::context_index::ContextIndex::new();
-        let sidecar_path = std::env::temp_dir().join("directory-spider-empty-index-test.json");
-        let _ = fs::remove_file(&sidecar_path);
+        let mut first_entry = true;
+        let mut file_count = 0;
 
-        finalize_output_files(&mut writer, Some(&index), Some(&sidecar_path))
-            .expect("empty index finalizes main output");
+        let err = emit_entry(
+            &mut writer,
+            &entry,
+            changed,
+            Some(&index),
+            Some(&base),
+            &mut first_entry,
+            &mut file_count,
+            0,
+        )
+        .expect_err("sidecar snapshot cannot persist over directory");
 
-        assert_eq!(String::from_utf8(writer).unwrap(), "[]");
-        assert!(!sidecar_path.exists());
+        assert!(err.to_string().contains("failed to write context index"));
+        assert_eq!(String::from_utf8(writer).unwrap(), "[");
+        assert!(first_entry);
+        assert_eq!(file_count, 0);
+        fs::remove_dir_all(base).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn emit_entry_writes_sidecar_that_resolves_streamed_hashes() {
+        let base = unique_temp_dir("sidecar-emit-invariant");
+        fs::create_dir_all(&base).expect("create fixture directory");
+        let file_path = base.join("notes.txt");
+        fs::write(&file_path, "before secret after").expect("write fixture file");
+        let sidecar_path = base.join("context-index.json");
+        let mut entry =
+            crate::metadata::FileMetadata::metadata_from_path(&file_path).expect("metadata builds");
+        entry.matched_keywords = vec!["secret".to_string()];
+        entry.matches = vec![crate::metadata::MatchHit {
+            keyword: "secret".to_string(),
+            line: 1,
+            column: 8,
+            before: "before ".to_string(),
+            r#match: "secret".to_string(),
+            after: " after".to_string(),
+            before_hash: None,
+            after_hash: None,
+        }];
+        let mut index = crate::context_index::ContextIndex::new();
+        let changed = index.replace_match_contexts(&mut entry.matches);
+        let mut writer = Vec::from(&b"["[..]);
+        let mut first_entry = true;
+        let mut file_count = 0;
+
+        emit_entry(
+            &mut writer,
+            &entry,
+            changed,
+            Some(&index),
+            Some(&sidecar_path),
+            &mut first_entry,
+            &mut file_count,
+            0,
+        )
+        .expect("entry emits");
+
+        writer.push(b']');
+        let output: Value =
+            serde_json::from_slice(&writer).expect("streamed output fragment is valid json");
+        let sidecar: Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar_path).expect("sidecar exists"))
+                .expect("sidecar is valid json");
+        let hit = &output[0]["matches"][0];
+        let before_hash = hit["before_hash"].as_str().expect("before hash exists");
+        let after_hash = hit["after_hash"].as_str().expect("after hash exists");
+        assert_eq!(
+            sidecar["values"][before_hash],
+            Value::String("before ".to_string())
+        );
+        assert_eq!(
+            sidecar["values"][after_hash],
+            Value::String(" after".to_string())
+        );
+        assert_eq!(file_count, 1);
+        fs::remove_dir_all(base).expect("remove fixture directory");
     }
 }

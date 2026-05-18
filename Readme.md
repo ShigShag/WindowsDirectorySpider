@@ -41,12 +41,12 @@ Match output:
       --max-context-line-chars <MAX_CONTEXT_LINE_CHARS>
           Max characters per emitted context line/segment, not total before/after field size (0 = unlimited) [default: 0]
       --hash-context-lines
-          Replace repeated match context text with compact hashes; see --context-index-path
+          Replace repeated match context text with compact hashes and update --context-index-path during the scan
 
 Output:
   -o, --output-path <OUTPUT_PATH>  Output JSON file [default: metadata.json]
       --context-index-path <CONTEXT_INDEX_PATH>
-          Output path for the sidecar context hash index used by --hash-context-lines
+          Output path for the sidecar context hash index updated by --hash-context-lines
       --flush-every <FLUSH_EVERY>  Flush output to disk every N entries (0 = only at end) [default: 100]
 
 Note: `-k` takes EXTENSIONS, not keywords. Search terms go in `--keywords`.
@@ -77,8 +77,15 @@ The sidecar index maps each hash back to the original value:
 ```
 
 If `--context-index-path` is omitted, the sidecar path is derived from the output
-path, for example `metadata.json` writes `metadata.context-index.json`. No
-sidecar is written when no context values are indexed.
+path, for example `metadata.json` writes `metadata.context-index.json`. The
+sidecar is initialized at scan start and updated before emitting entries that
+reference newly indexed context. Valid zero-match hash-mode scans leave an empty
+sidecar index.
+
+The sidecar is rewritten as a full JSON snapshot whenever a new context value is
+indexed. This keeps crash recovery and tail-readers decodable, but on
+non-repetitive corpora it can create more write traffic than the main output's
+`--flush-every` cadence.
 
 ### Keyword list
 
