@@ -2,10 +2,11 @@ use clap::Parser;
 use parselnk::Lnk;
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufWriter, Write};
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
+mod context_index;
 mod helper;
 mod metadata;
 mod scanner;
@@ -18,6 +19,7 @@ Examples:
   jinx.exe -d \\\\fs01\\share -i docx,xlsx -o share.json
   jinx.exe -L roots.txt --keyword-regex \"AKIA[0-9A-Z]{16}\"
   jinx.exe -d C:\\Logs -i txt,log --keywords password --matches-only
+  jinx.exe -d C:\\Logs -i txt,log --keywords password --matches-only --hash-context-lines
 
 Run `--help` for full docs and more examples.
 ";
@@ -65,6 +67,11 @@ Matches-only mode (emit only files with hits, include snippet around each match)
       --matches-only --context-lines 2 --context-words 6 \\
       --max-context-line-chars 500
 
+Deduplicate large context snippets with a sidecar hash index:
+  jinx.exe -d C:\\Logs -i txt,log --keywords password,secret \\
+      --matches-only --context-lines 5 --context-words 0 \\
+      --hash-context-lines --context-index-path context-index.json
+
   Each match in `matches[]` is split into `before` / `match` / `after` exact
   substrings of the decoded file content. `line` is 1-based; `column` is the
   1-based BYTE offset of the match start within its line (not character or
@@ -74,6 +81,12 @@ Matches-only mode (emit only files with hits, include snippet around each match)
   text nearest the match (0 = unlimited). The --max-matches-per-file cap
   (default 100) bounds `matches[]` per file; `matched_keywords` still lists
   every distinct needle that matched, independent of the cap.
+  --hash-context-lines works with or without --matches-only. It replaces
+  `before` / `after` with `before_hash` / `after_hash` keys for emitted
+  matches and writes a sidecar index mapping compact BLAKE3-128 base64url
+  hashes to the original context text. If --context-index-path is omitted,
+  the sidecar path is derived from --output-path. No sidecar is written when
+  no context values are indexed.
 ";
 
 const KEYWORD_REGEX_LONG: &str = "\
@@ -179,14 +192,30 @@ pub struct Args {
     #[arg(long, default_value_t = 0, help_heading = "Match output")]
     pub max_context_line_chars: usize,
 
+    /// Replace repeated match context text with compact hashes; see --context-index-path.
+    #[arg(long, help_heading = "Match output")]
+    pub hash_context_lines: bool,
+
     // === Output ===
     /// Output JSON file.
     #[arg(short, long, default_value = "metadata.json", help_heading = "Output")]
     output_path: PathBuf,
 
+    /// Output path for the sidecar context hash index used by --hash-context-lines.
+    #[arg(long, help_heading = "Output")]
+    context_index_path: Option<PathBuf>,
+
     /// Flush output to disk every N entries (0 = only at end).
     #[arg(long, default_value_t = 100, help_heading = "Output")]
     pub flush_every: u64,
+}
+
+impl Args {
+    fn resolved_context_index_path(&self) -> PathBuf {
+        self.context_index_path
+            .clone()
+            .unwrap_or_else(|| context_index::default_context_index_path(&self.output_path))
+    }
 }
 
 fn walk_path(
@@ -225,6 +254,9 @@ fn walk_path(
     // Init file counter
     let mut file_count: u64 = 0;
     let mut first_entry = true;
+    let mut context_index = cli_args
+        .hash_context_lines
+        .then(context_index::ContextIndex::new);
 
     // Periodic flush cadence — push buffered bytes to disk every N entries so the
     // output file grows during the scan instead of appearing empty until the end.
@@ -297,6 +329,9 @@ fn walk_path(
                 let result = scanner.scan(&serialized_entry.full_path, serialized_entry.size);
                 serialized_entry.matched_keywords = result.keywords;
                 serialized_entry.matches = result.matches;
+                if let Some(index) = context_index.as_mut() {
+                    index.replace_match_contexts(&mut serialized_entry.matches);
+                }
             }
 
             // Matches-only mode suppresses *writing* a file with no hits, but must NOT skip the
@@ -370,6 +405,11 @@ fn walk_path(
                                         );
                                         serialized_entry.matched_keywords = result.keywords;
                                         serialized_entry.matches = result.matches;
+                                        if let Some(index) = context_index.as_mut() {
+                                            index.replace_match_contexts(
+                                                &mut serialized_entry.matches,
+                                            );
+                                        }
                                     }
 
                                     if cli_args.matches_only
@@ -418,13 +458,38 @@ fn walk_path(
     // Close the JSON array and force a final flush so the file is complete on disk.
     // Final-write failures are propagated to the caller so it can avoid claiming
     // success when the on-disk file is truncated or invalid.
+    let context_index_path = context_index
+        .as_ref()
+        .map(|_| cli_args.resolved_context_index_path());
     let finalize = (|| -> std::io::Result<()> {
-        writer.write_all(b"]")?;
-        writer.flush()?;
-        Ok(())
+        finalize_output_files(
+            &mut writer,
+            context_index.as_ref(),
+            context_index_path.as_deref(),
+        )
     })();
 
     (file_count, finalize)
+}
+
+fn finalize_output_files<W: Write>(
+    writer: &mut W,
+    context_index: Option<&context_index::ContextIndex>,
+    context_index_path: Option<&Path>,
+) -> std::io::Result<()> {
+    if let (Some(index), Some(path)) = (context_index, context_index_path) {
+        if !index.is_empty() {
+            index.write_to_path(path).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("failed to write context index {}: {}", path.display(), err),
+                )
+            })?;
+        }
+    }
+
+    writer.write_all(b"]")?;
+    writer.flush()
 }
 
 /// Serialize a single entry into the open JSON array. Handles the comma separator
@@ -511,6 +576,42 @@ fn collect_keywords(args: &Args) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+fn validate_output_paths(args: &Args) -> Result<(), String> {
+    if args.hash_context_lines
+        && normalized_output_path_for_compare(&args.resolved_context_index_path())?
+            == normalized_output_path_for_compare(&args.output_path)?
+    {
+        return Err("--context-index-path must not equal --output-path".to_string());
+    }
+    Ok(())
+}
+
+fn normalized_output_path_for_compare(path: &Path) -> Result<String, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to resolve current directory: {}", e))?
+            .join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    Ok(normalized
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_lowercase())
+}
+
 fn main() {
     let mut args = Args::parse();
 
@@ -530,6 +631,11 @@ fn main() {
         }
     };
 
+    if let Err(err) = validate_output_paths(&args) {
+        eprintln!("[!] {}", err);
+        std::process::exit(2);
+    }
+
     let scanner = match scanner::KeywordScanner::new(&args) {
         Ok(s) => s,
         Err(err) => {
@@ -542,7 +648,7 @@ fn main() {
 
     if let Err(err) = finalize_result {
         eprintln!(
-            "[!] Failed to finalize output {:?}: {} ({} entries written before failure)",
+            "[!] Failed to finalize output files for {:?}: {} ({} entries written before failure)",
             args.output_path, err, file_count
         );
         std::process::exit(3);
@@ -555,5 +661,143 @@ fn main() {
         );
     } else {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{finalize_output_files, validate_output_paths, Args};
+    use clap::Parser;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn hash_context_lines_flag_enables_default_sidecar_path() {
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "secret",
+            "--hash-context-lines",
+        ])
+        .expect("arguments parse");
+
+        assert!(args.hash_context_lines);
+        assert_eq!(
+            args.resolved_context_index_path(),
+            PathBuf::from("metadata.context-index.json")
+        );
+    }
+
+    #[test]
+    fn context_index_path_overrides_default_sidecar_path() {
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "secret",
+            "--hash-context-lines",
+            "--context-index-path",
+            "custom-index.json",
+        ])
+        .expect("arguments parse");
+
+        assert_eq!(
+            args.resolved_context_index_path(),
+            PathBuf::from("custom-index.json")
+        );
+    }
+
+    #[test]
+    fn hash_context_sidecar_path_cannot_match_output_path() {
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "secret",
+            "--hash-context-lines",
+            "-o",
+            "metadata.json",
+            "--context-index-path",
+            "metadata.json",
+        ])
+        .expect("arguments parse");
+
+        let err = validate_output_paths(&args).expect_err("matching paths are rejected");
+
+        assert!(err.contains("--context-index-path must not equal --output-path"));
+    }
+
+    #[test]
+    fn hash_context_sidecar_path_rejects_dot_alias_of_output_path() {
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "secret",
+            "--hash-context-lines",
+            "-o",
+            "metadata.json",
+            "--context-index-path",
+            ".\\metadata.json",
+        ])
+        .expect("arguments parse");
+
+        let err = validate_output_paths(&args).expect_err("matching paths are rejected");
+
+        assert!(err.contains("--context-index-path must not equal --output-path"));
+    }
+
+    #[test]
+    fn hash_context_sidecar_path_rejects_case_alias_of_output_path() {
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "secret",
+            "--hash-context-lines",
+            "-o",
+            "metadata.json",
+            "--context-index-path",
+            "Metadata.json",
+        ])
+        .expect("arguments parse");
+
+        let err = validate_output_paths(&args).expect_err("matching paths are rejected");
+
+        assert!(err.contains("--context-index-path must not equal --output-path"));
+    }
+
+    #[test]
+    fn sidecar_failure_leaves_main_json_unclosed() {
+        let mut writer = Vec::from(&b"["[..]);
+        let mut index = crate::context_index::ContextIndex::new();
+        index.insert("context");
+        let sidecar_path = std::env::temp_dir();
+
+        let err = finalize_output_files(&mut writer, Some(&index), Some(&sidecar_path))
+            .expect_err("directory path cannot be created as a sidecar file");
+
+        assert!(err.to_string().contains("failed to write context index"));
+        assert_eq!(String::from_utf8(writer).unwrap(), "[");
+    }
+
+    #[test]
+    fn empty_context_index_does_not_write_sidecar() {
+        let mut writer = Vec::from(&b"["[..]);
+        let index = crate::context_index::ContextIndex::new();
+        let sidecar_path = std::env::temp_dir().join("directory-spider-empty-index-test.json");
+        let _ = fs::remove_file(&sidecar_path);
+
+        finalize_output_files(&mut writer, Some(&index), Some(&sidecar_path))
+            .expect("empty index finalizes main output");
+
+        assert_eq!(String::from_utf8(writer).unwrap(), "[]");
+        assert!(!sidecar_path.exists());
     }
 }

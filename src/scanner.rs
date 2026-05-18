@@ -197,6 +197,8 @@ fn build_hit(
         before,
         r#match: matched_text,
         after,
+        before_hash: None,
+        after_hash: None,
     }
 }
 

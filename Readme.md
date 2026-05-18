@@ -40,9 +40,13 @@ Match output:
           Cap on MatchHits emitted per file (0 = unlimited). `matched_keywords` still lists every distinct hit [default: 100]
       --max-context-line-chars <MAX_CONTEXT_LINE_CHARS>
           Max characters per emitted context line/segment, not total before/after field size (0 = unlimited) [default: 0]
+      --hash-context-lines
+          Replace repeated match context text with compact hashes; see --context-index-path
 
 Output:
   -o, --output-path <OUTPUT_PATH>  Output JSON file [default: metadata.json]
+      --context-index-path <CONTEXT_INDEX_PATH>
+          Output path for the sidecar context hash index used by --hash-context-lines
       --flush-every <FLUSH_EVERY>  Flush output to disk every N entries (0 = only at end) [default: 100]
 
 Note: `-k` takes EXTENSIONS, not keywords. Search terms go in `--keywords`.
@@ -52,7 +56,30 @@ Examples:
   jinx.exe -d \\fs01\share -i docx,xlsx -o share.json
   jinx.exe -L roots.txt --keyword-regex "AKIA[0-9A-Z]{16}"
   jinx.exe -d C:\Logs -i txt,log --keywords password --matches-only
+  jinx.exe -d C:\Logs -i txt,log --keywords password --matches-only --hash-context-lines
 ```
+
+### Context hash index
+
+Use `--hash-context-lines` when match outputs get too large because many matches
+repeat the same `before` / `after` context. It works with or without
+`--matches-only`; only emitted `matches[]` entries change. The main output then
+contains `before_hash` and `after_hash` fields instead of the full context text.
+The sidecar index maps each hash back to the original value:
+
+```json
+{
+  "algorithm": "blake3-128-base64url-no-pad",
+  "values": {
+    "b3:7Jf4nqZK9vX0lL2mQ8pTaw": "full context text"
+  }
+}
+```
+
+If `--context-index-path` is omitted, the sidecar path is derived from the output
+path, for example `metadata.json` writes `metadata.context-index.json`. No
+sidecar is written when no context values are indexed.
+
 ### Keyword list
 
 ```
@@ -95,7 +122,7 @@ AutoAdminLogon
 ### Command for share enum
 
 ```bash
-DirectorySpider.exe -L share_list.txt -i txt,log,md,csv,tsv,rtf,ini,cfg,conf,config,xml,yaml,yml,toml,properties,env,json,ps1,psm1,psd1,bat,cmd,sh,bash,zsh,vbs,js,reg,sql,py,rb,php,pl,java,cs,go,rs,ts,bak,old,backup,orig,tmp,docx,xlsx,pptx,pdf --keywords-file keywords.txt --matches-only --context-lines 5 --context-words 0 --max-context-line-chars 500
+DirectorySpider.exe -L share_list.txt -i txt,log,md,csv,tsv,rtf,ini,cfg,conf,config,xml,yaml,yml,toml,properties,env,json,ps1,psm1,psd1,bat,cmd,sh,bash,zsh,vbs,js,reg,sql,py,rb,php,pl,java,cs,go,rs,ts,bak,old,backup,orig,tmp,docx,xlsx,pptx,pdf --keywords-file keywords.txt --matches-only --context-lines 5 --context-words 0 --max-context-line-chars 500 --hash-context-lines
 ```
 
 ## Remarks
