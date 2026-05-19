@@ -23,6 +23,10 @@ Content scan scope:
       --max-scan-size <MAX_SCAN_SIZE>
           Max file size (bytes) scanned for keywords [default: 10485760]
 
+Scan execution:
+      --threads <THREADS>
+          Number of worker threads for metadata and content scanning (1 = single-threaded) [default: 1]
+
 Search terms:
       --keywords <KEYWORDS>            Literal search terms (comma-separated). THIS is the keyword flag
       --keywords-file <KEYWORDS_FILE>  File of newline-separated literal keywords (# and blank lines ignored)
@@ -57,6 +61,7 @@ Examples:
   jinx.exe -L roots.txt --keyword-regex "AKIA[0-9A-Z]{16}"
   jinx.exe -d C:\Logs -i txt,log --keywords password --matches-only
   jinx.exe -d C:\Logs -i txt,log --keywords password --matches-only --hash-context-lines
+  jinx.exe -d C:\Logs -i txt,log --keywords password --matches-only --threads 4
 ```
 
 ### Context hash index
