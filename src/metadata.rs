@@ -1,7 +1,7 @@
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 use std::ffi::OsStr;
-use std::io::{Error, ErrorKind};
+use std::io::Error;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -77,7 +77,12 @@ impl FileMetadata {
     pub fn metadata_from_path(path: &Path) -> Result<Self, std::io::Error> {
         let metadata = match path.metadata() {
             Ok(value) => value,
-            Err(_) => return Err(Error::new(ErrorKind::Other, "Metadata could not be parsed")),
+            Err(err) => {
+                return Err(Error::new(
+                    err.kind(),
+                    format!("metadata read {}: {}", path.display(), err),
+                ))
+            }
         };
 
         let file_name = path
