@@ -47,14 +47,14 @@ Match output:
       --max-context-line-chars <MAX_CONTEXT_LINE_CHARS>
           Max characters per emitted context line/segment, not total before/after field size (0 = unlimited) [default: 0]
       --hash-context-lines
-          Replace repeated match context text with compact hashes and write --context-index-path at the end
+          Replace repeated match context text with compact hashes and update --context-index-path during the scan
       --live-context-index
-          Update --context-index-path during the scan instead of only at the end
+          Compatibility flag; --hash-context-lines already updates --context-index-path during the scan
 
 Output:
   -o, --output-path <OUTPUT_PATH>  Output JSON file [default: metadata.json]
       --context-index-path <CONTEXT_INDEX_PATH>
-          Output path for the sidecar context hash index written by --hash-context-lines
+          Output path for the sidecar context hash index updated by --hash-context-lines
       --flush-every <FLUSH_EVERY>  Flush output to disk every N entries (0 = only at end) [default: 100]
 
 Note: `-k` takes EXTENSIONS, not keywords. Search terms go in `--keywords`.
@@ -96,15 +96,10 @@ The sidecar index maps each hash back to the original value:
 
 If `--context-index-path` is omitted, the sidecar path is derived from the output
 path, for example `metadata.json` writes `metadata.context-index.json`. The
-sidecar is written after the main JSON output is closed. Valid zero-match
-hash-mode scans leave an empty sidecar index.
-
-Use `--live-context-index` when crash recovery or tail-readers must decode
-hashed entries during the scan. Live mode initializes the sidecar at scan start
-and rewrites a full JSON snapshot whenever a new context value is indexed,
-before emitting entries that reference it. This creates more write traffic than
-the main output's `--flush-every` cadence and is more sensitive to Windows/SMB
-file replacement failures.
+sidecar is initialized at scan start and rewritten before emitting entries that
+reference newly indexed context. Valid zero-match hash-mode scans leave an empty
+sidecar index. `--live-context-index` is accepted for compatibility; runtime
+sidecar writes are already enabled by `--hash-context-lines`.
 
 ### Keyword list
 
