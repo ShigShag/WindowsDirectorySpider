@@ -91,13 +91,14 @@ Deduplicate large context snippets with a sidecar hash index:
   every distinct needle that matched, independent of the cap.
   --hash-context-lines works with or without --matches-only. It replaces
   `before` / `after` with `before_hash` / `after_hash` keys for emitted
-  matches and updates a sidecar index during the scan, before emitting entries
-  that reference newly indexed context. The sidecar maps compact BLAKE3-128
-  base64url hashes to the original context text. If --context-index-path is
-  omitted, the sidecar path is derived from --output-path. Valid zero-match
-  hash-mode scans leave an empty sidecar index. The sidecar is rewritten as a
-  full JSON snapshot whenever a new context value is indexed, so non-repetitive
-  corpora trade extra write traffic for crash/tail-reader decodability.
+  matches and writes a sidecar index at the end of the scan. The sidecar maps
+  compact BLAKE3-128 base64url hashes to the original context text. If
+  --context-index-path is omitted, the sidecar path is derived from
+  --output-path. Valid zero-match hash-mode scans leave an empty sidecar index.
+  Use --live-context-index to rewrite the full sidecar snapshot whenever a new
+  context value is indexed, before emitting entries that reference newly indexed
+  context. Live mode is useful for crash/tail-reader decodability but is more
+  sensitive to Windows/SMB file replacement failures.
 ";
 
 const KEYWORD_REGEX_LONG: &str = "\
@@ -213,16 +214,20 @@ pub struct Args {
     #[arg(long, default_value_t = 0, help_heading = "Match output")]
     pub max_context_line_chars: usize,
 
-    /// Replace repeated match context text with compact hashes and update --context-index-path during the scan.
+    /// Replace repeated match context text with compact hashes and write --context-index-path at the end.
     #[arg(long, help_heading = "Match output")]
     pub hash_context_lines: bool,
+
+    /// Update --context-index-path during the scan instead of only at the end.
+    #[arg(long, help_heading = "Match output")]
+    pub live_context_index: bool,
 
     // === Output ===
     /// Output JSON file.
     #[arg(short, long, default_value = "metadata.json", help_heading = "Output")]
     output_path: PathBuf,
 
-    /// Output path for the sidecar context hash index updated by --hash-context-lines.
+    /// Output path for the sidecar context hash index written by --hash-context-lines.
     #[arg(long, help_heading = "Output")]
     context_index_path: Option<PathBuf>,
 
@@ -292,9 +297,11 @@ fn walk_path(
     let context_index_path = context_index
         .as_ref()
         .map(|_| cli_args.resolved_context_index_path());
-    if let (Some(index), Some(path)) = (context_index.as_ref(), context_index_path.as_deref()) {
-        if let Err(err) = write_context_index_snapshot(index, path) {
-            return (0, Err(err));
+    if cli_args.live_context_index {
+        if let (Some(index), Some(path)) = (context_index.as_ref(), context_index_path.as_deref()) {
+            if let Err(err) = write_context_index_snapshot(index, path) {
+                return (0, Err(err));
+            }
         }
     }
 
@@ -378,8 +385,16 @@ fn walk_path(
                     &mut writer,
                     &serialized_entry,
                     context_index_changed,
-                    context_index.as_ref(),
-                    context_index_path.as_deref(),
+                    if cli_args.live_context_index {
+                        context_index.as_ref()
+                    } else {
+                        None
+                    },
+                    if cli_args.live_context_index {
+                        context_index_path.as_deref()
+                    } else {
+                        None
+                    },
                     &mut first_entry,
                     &mut file_count,
                     flush_every,
@@ -451,8 +466,16 @@ fn walk_path(
                                         &mut writer,
                                         &serialized_entry,
                                         context_index_changed,
-                                        context_index.as_ref(),
-                                        context_index_path.as_deref(),
+                                        if cli_args.live_context_index {
+                                            context_index.as_ref()
+                                        } else {
+                                            None
+                                        },
+                                        if cli_args.live_context_index {
+                                            context_index_path.as_deref()
+                                        } else {
+                                            None
+                                        },
                                         &mut first_entry,
                                         &mut file_count,
                                         flush_every,
@@ -495,8 +518,10 @@ fn walk_path(
 
     // Close the JSON array and force a final flush so the file is complete on disk.
     // Final-write failures are propagated to the caller so it can avoid claiming
-    // success when the on-disk file is truncated or invalid.
-    let finalize = finalize_output_files(&mut writer);
+    // success when either output file could not be completed on disk.
+    let finalize = finalize_output_files(&mut writer).and_then(|_| {
+        write_final_context_index(context_index.as_ref(), context_index_path.as_deref())
+    });
 
     (file_count, finalize)
 }
@@ -632,6 +657,7 @@ fn walk_path_parallel(
                         &mut writer,
                         context_index.as_mut(),
                         context_index_path.as_deref(),
+                        cli_args.live_context_index,
                         &mut first_entry,
                         &mut file_count,
                         flush_every,
@@ -653,6 +679,7 @@ fn walk_path_parallel(
                                 &mut writer,
                                 context_index.as_mut(),
                                 context_index_path.as_deref(),
+                                cli_args.live_context_index,
                                 &mut first_entry,
                                 &mut file_count,
                                 flush_every,
@@ -680,6 +707,7 @@ fn walk_path_parallel(
                     &mut writer,
                     context_index.as_mut(),
                     context_index_path.as_deref(),
+                    cli_args.live_context_index,
                     &mut first_entry,
                     &mut file_count,
                     flush_every,
@@ -702,7 +730,9 @@ fn walk_path_parallel(
         return (file_count, Err(err));
     }
 
-    let finalize = finalize_output_files(&mut writer);
+    let finalize = finalize_output_files(&mut writer).and_then(|_| {
+        write_final_context_index(context_index.as_ref(), context_index_path.as_deref())
+    });
     (file_count, finalize)
 }
 
@@ -823,6 +853,7 @@ fn receive_parallel_result(
     writer: &mut BufWriter<File>,
     context_index: Option<&mut context_index::ContextIndex>,
     context_index_path: Option<&Path>,
+    live_context_index: bool,
     first_entry: &mut bool,
     file_count: &mut u64,
     flush_every: u64,
@@ -842,6 +873,7 @@ fn receive_parallel_result(
         writer,
         context_index,
         context_index_path,
+        live_context_index,
         first_entry,
         file_count,
         flush_every,
@@ -856,6 +888,7 @@ fn handle_parallel_result(
     writer: &mut BufWriter<File>,
     mut context_index: Option<&mut context_index::ContextIndex>,
     context_index_path: Option<&Path>,
+    live_context_index: bool,
     first_entry: &mut bool,
     file_count: &mut u64,
     flush_every: u64,
@@ -879,8 +912,16 @@ fn handle_parallel_result(
                 writer,
                 &entry,
                 context_index_changed,
-                context_index.as_deref(),
-                context_index_path,
+                if live_context_index {
+                    context_index.as_deref()
+                } else {
+                    None
+                },
+                if live_context_index {
+                    context_index_path
+                } else {
+                    None
+                },
                 first_entry,
                 file_count,
                 flush_every,
@@ -908,6 +949,16 @@ fn handle_parallel_result(
 fn finalize_output_files<W: Write>(writer: &mut W) -> std::io::Result<()> {
     writer.write_all(b"]")?;
     writer.flush()
+}
+
+fn write_final_context_index(
+    index: Option<&context_index::ContextIndex>,
+    path: Option<&Path>,
+) -> std::io::Result<()> {
+    if let (Some(index), Some(path)) = (index, path) {
+        write_context_index_snapshot(index, path)?;
+    }
+    Ok(())
 }
 
 fn write_context_index_snapshot(
@@ -1042,6 +1093,10 @@ fn collect_keywords(args: &Args) -> Result<Vec<String>, String> {
 }
 
 fn validate_output_paths(args: &Args) -> Result<(), String> {
+    if args.live_context_index && !args.hash_context_lines {
+        return Err("--live-context-index requires --hash-context-lines".to_string());
+    }
+
     if args.hash_context_lines
         && normalized_output_path_for_compare(&args.resolved_context_index_path())?
             == normalized_output_path_for_compare(&args.output_path)?
@@ -1371,6 +1426,7 @@ mod tests {
             "secret",
             "--matches-only",
             "--hash-context-lines",
+            "--live-context-index",
             "--context-index-path",
             sidecar_path.to_str().expect("sidecar path is utf-8"),
             "--threads",
@@ -1404,6 +1460,66 @@ mod tests {
             let after_hash = hit["after_hash"].as_str().expect("after hash exists");
             assert!(hit.get("before").is_none());
             assert!(hit.get("after").is_none());
+            assert_eq!(
+                sidecar["values"][before_hash],
+                Value::String(before.to_string())
+            );
+            assert_eq!(
+                sidecar["values"][after_hash],
+                Value::String(after.to_string())
+            );
+        }
+        fs::remove_dir_all(base).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn threaded_hash_mode_writes_final_sidecar_without_live_updates() {
+        let base = unique_temp_dir("threaded-sidecar-final-update");
+        let root = base.join("input");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("a.txt"), "alpha secret first").expect("write first fixture file");
+        fs::write(root.join("b.txt"), "bravo secret second").expect("write second fixture file");
+        fs::write(root.join("c.txt"), "charlie secret third").expect("write third fixture file");
+        let output_path = base.join("metadata.json");
+        let sidecar_path = base.join("metadata.context-index.json");
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            root.to_str().expect("temp path is utf-8"),
+            "-o",
+            output_path.to_str().expect("output path is utf-8"),
+            "--keywords",
+            "secret",
+            "--matches-only",
+            "--hash-context-lines",
+            "--context-index-path",
+            sidecar_path.to_str().expect("sidecar path is utf-8"),
+            "--threads",
+            "4",
+        ])
+        .expect("arguments parse");
+        let scanner = crate::scanner::KeywordScanner::new(&args).expect("scanner builds");
+
+        let (_file_count, result) = walk_path(&args, &[root.clone()], &scanner);
+
+        result.expect("scan finalizes");
+        let output: Value =
+            serde_json::from_str(&fs::read_to_string(&output_path).expect("main output exists"))
+                .expect("main output is valid json");
+        let sidecar: Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar_path).expect("sidecar exists"))
+                .expect("sidecar is valid json");
+        let output = output.as_array().expect("main output is an array");
+        assert_eq!(output.len(), 3);
+
+        for (entry, before, after) in [
+            (&output[0], "alpha ", " first"),
+            (&output[1], "bravo ", " second"),
+            (&output[2], "charlie ", " third"),
+        ] {
+            let hit = &entry["matches"][0];
+            let before_hash = hit["before_hash"].as_str().expect("before hash exists");
+            let after_hash = hit["after_hash"].as_str().expect("after hash exists");
             assert_eq!(
                 sidecar["values"][before_hash],
                 Value::String(before.to_string())
@@ -1480,6 +1596,24 @@ mod tests {
     }
 
     #[test]
+    fn live_context_index_requires_hash_context_lines() {
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "secret",
+            "--live-context-index",
+        ])
+        .expect("arguments parse");
+
+        let err = validate_output_paths(&args)
+            .expect_err("live sidecar updates require hash context mode");
+
+        assert!(err.contains("--live-context-index requires --hash-context-lines"));
+    }
+
+    #[test]
     fn hash_mode_writes_empty_sidecar_for_zero_context_scan() {
         let root = unique_temp_dir("empty-sidecar");
         fs::create_dir_all(&root).expect("create fixture directory");
@@ -1516,8 +1650,8 @@ mod tests {
     }
 
     #[test]
-    fn hash_mode_sidecar_init_failure_leaves_main_json_unclosed() {
-        let root = unique_temp_dir("sidecar-init-failure");
+    fn hash_mode_final_sidecar_failure_leaves_main_json_closed() {
+        let root = unique_temp_dir("sidecar-final-failure");
         fs::create_dir_all(&root).expect("create fixture directory");
         fs::write(root.join("notes.txt"), "secret context").expect("write fixture file");
         let output_path = root.join("metadata.json");
@@ -1529,6 +1663,7 @@ mod tests {
             output_path.to_str().expect("output path is utf-8"),
             "--keywords",
             "secret",
+            "--matches-only",
             "--hash-context-lines",
             "--context-index-path",
             root.to_str().expect("temp path is utf-8"),
@@ -1536,10 +1671,45 @@ mod tests {
         .expect("arguments parse");
         let scanner = crate::scanner::KeywordScanner::new(&args).expect("scanner builds");
 
-        let (_file_count, result) = walk_path(&args, &[root.clone()], &scanner);
+        let (file_count, result) = walk_path(&args, &[root.clone()], &scanner);
 
         let err = result.expect_err("directory path cannot be sidecar file");
         assert!(err.to_string().contains("failed to write context index"));
+        assert_eq!(file_count, 1);
+        let main_output = fs::read_to_string(&output_path).expect("main output was opened");
+        let output: Value = serde_json::from_str(&main_output).expect("main output is valid json");
+        assert_eq!(output.as_array().expect("main output is an array").len(), 1);
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn live_hash_mode_sidecar_init_failure_leaves_main_json_unclosed() {
+        let root = unique_temp_dir("sidecar-live-init-failure");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        fs::write(root.join("notes.txt"), "secret context").expect("write fixture file");
+        let output_path = root.join("metadata.json");
+        let args = Args::try_parse_from([
+            "DirectorySpider",
+            "-d",
+            root.to_str().expect("temp path is utf-8"),
+            "-o",
+            output_path.to_str().expect("output path is utf-8"),
+            "--keywords",
+            "secret",
+            "--matches-only",
+            "--hash-context-lines",
+            "--live-context-index",
+            "--context-index-path",
+            root.to_str().expect("temp path is utf-8"),
+        ])
+        .expect("arguments parse");
+        let scanner = crate::scanner::KeywordScanner::new(&args).expect("scanner builds");
+
+        let (file_count, result) = walk_path(&args, &[root.clone()], &scanner);
+
+        let err = result.expect_err("directory path cannot be sidecar file");
+        assert!(err.to_string().contains("failed to write context index"));
+        assert_eq!(file_count, 0);
         let main_output = fs::read_to_string(&output_path).expect("main output was opened");
         assert_eq!(main_output, "[");
         fs::remove_dir_all(root).expect("remove fixture directory");

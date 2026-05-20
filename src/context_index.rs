@@ -3,8 +3,11 @@ use base64::Engine;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::fs;
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use crate::metadata::MatchHit;
 
@@ -48,17 +51,80 @@ impl ContextIndex {
     }
 
     pub fn write_to_path(&self, path: &Path) -> std::io::Result<()> {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let mut tempfile = tempfile::Builder::new()
-            .prefix(".context-index-")
-            .suffix(".partial")
-            .tempfile_in(parent)?;
-        serde_json::to_writer(tempfile.as_file_mut(), self)?;
-        tempfile.as_file_mut().flush()?;
-        tempfile.persist(path).map(|_| ()).map_err(|err| err.error)
+        let bytes = serde_json::to_vec(self)?;
+
+        for attempt in 0..=5 {
+            match write_to_path_atomic(path, &bytes) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                    if attempt < 5 {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        write_to_path_fallback(path, &bytes)
+    }
+}
+
+fn write_to_path_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tempfile = tempfile::Builder::new()
+        .prefix(".context-index-")
+        .suffix(".partial")
+        .tempfile_in(parent)?;
+    tempfile.as_file_mut().write_all(bytes)?;
+    tempfile.as_file_mut().flush()?;
+    tempfile.persist(path).map(|_| ()).map_err(|err| err.error)
+}
+
+fn write_to_path_fallback(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tempfile = tempfile::Builder::new()
+        .prefix(".context-index-fallback-")
+        .suffix(".partial")
+        .tempfile_in(parent)?;
+    tempfile.as_file_mut().write_all(bytes)?;
+    tempfile.as_file_mut().flush()?;
+
+    let mut temp_path = tempfile.into_temp_path();
+    let temp_path_buf = temp_path.to_path_buf();
+
+    match fs::rename(&temp_path_buf, path) {
+        Ok(()) => {
+            temp_path.disable_cleanup(true);
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            let replace_err = err;
+            if let Err(remove_err) = fs::remove_file(path) {
+                return Err(io::Error::new(
+                    replace_err.kind(),
+                    format!(
+                        "failed to replace existing context index {}: {}; failed to remove existing destination: {}",
+                        path.display(),
+                        replace_err,
+                        remove_err
+                    ),
+                ));
+            }
+            match fs::rename(&temp_path_buf, path) {
+                Ok(()) => {
+                    temp_path.disable_cleanup(true);
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
     }
 }
 
