@@ -26,6 +26,8 @@ Content scan scope:
 Scan execution:
       --threads <THREADS>
           Number of worker threads for metadata and content scanning (1 = single-threaded) [default: 1]
+  -q, --quiet
+          Suppress non-fatal scan diagnostics. Progress output is still shown
 
 Search terms:
       --keywords <KEYWORDS>            Literal search terms (comma-separated). THIS is the keyword flag
@@ -64,7 +66,16 @@ Examples:
   jinx.exe -d C:\Logs -i txt,log --keywords password --matches-only
   jinx.exe -d C:\Logs -i txt,log --keywords password --matches-only --hash-context-lines
   jinx.exe -d C:\Logs -i txt,log --keywords password --matches-only --threads 4
+  jinx.exe -d C:\Users -q
 ```
+
+### Progress and quiet diagnostics
+
+DirectorySpider prints the immediate child directory currently being scanned,
+for example `[*] Scanning top-level directory: C:\Users\Alice`. Use `-q` /
+`--quiet` to suppress non-fatal diagnostics such as access denied, metadata
+read failures, oversized-file scan skips, and shortcut parse warnings. Progress
+and fatal errors are still printed.
 
 ### Context hash index
 

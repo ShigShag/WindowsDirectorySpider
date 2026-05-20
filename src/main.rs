@@ -176,6 +176,10 @@ pub struct Args {
     )]
     pub threads: usize,
 
+    /// Suppress non-fatal scan diagnostics. Progress output is still shown.
+    #[arg(short = 'q', long, help_heading = "Scan execution")]
+    pub quiet: bool,
+
     // === Search terms ===
     /// Literal search terms (comma-separated). THIS is the keyword flag.
     #[arg(long, value_delimiter = ',', help_heading = "Search terms")]
@@ -255,6 +259,39 @@ fn parse_positive_usize(raw: &str) -> Result<usize, String> {
     }
 }
 
+fn should_log_diagnostic(cli_args: &Args) -> bool {
+    !cli_args.quiet
+}
+
+fn should_log_progress(_cli_args: &Args) -> bool {
+    true
+}
+
+fn log_diagnostic(cli_args: &Args, message: impl AsRef<str>) {
+    if should_log_diagnostic(cli_args) {
+        eprintln!("{}", message.as_ref());
+    }
+}
+
+fn log_progress(cli_args: &Args, message: impl AsRef<str>) {
+    if should_log_progress(cli_args) {
+        println!("{}", message.as_ref());
+    }
+}
+
+fn is_immediate_child_dir(base: &Path, path: &Path) -> bool {
+    path != base && path.parent().is_some_and(|parent| parent == base)
+}
+
+fn log_top_level_directory_progress(cli_args: &Args, base: &Path, path: &Path) {
+    if is_immediate_child_dir(base, path) {
+        log_progress(
+            cli_args,
+            format!("[*] Scanning top-level directory: {}", path.display()),
+        );
+    }
+}
+
 fn walk_path(
     cli_args: &Args,
     roots: &[PathBuf],
@@ -265,13 +302,19 @@ fn walk_path(
     let mut valid_roots: Vec<PathBuf> = Vec::with_capacity(roots.len());
     for root in roots {
         if !root.exists() {
-            eprintln!("[!] Skipping missing path: {}", root.display());
+            log_diagnostic(
+                cli_args,
+                format!("[!] Skipping missing path: {}", root.display()),
+            );
             continue;
         }
         valid_roots.push(root.clone());
     }
     if valid_roots.is_empty() {
-        eprintln!("[!] No valid paths to scan. Output file left untouched.");
+        log_diagnostic(
+            cli_args,
+            "[!] No valid paths to scan. Output file left untouched.",
+        );
         return (0, Ok(()));
     }
 
@@ -338,11 +381,15 @@ fn walk_path(
                     // Check if the directory was a base path which we previously visited | If so skip it
                     // This will skip the entire directory
                     let path = e.path();
+                    log_top_level_directory_progress(cli_args, &current_base, path);
 
                     if visited_base_paths.contains(path) {
-                        println!(
-                            "[*] Skipping directory, since already visited: {}",
-                            path.display()
+                        log_diagnostic(
+                            cli_args,
+                            format!(
+                                "[*] Skipping directory, since already visited: {}",
+                                path.display()
+                            ),
                         );
                     }
 
@@ -361,7 +408,7 @@ fn walk_path(
             let serialized_entry = match metadata::FileMetadata::metadata_from_path(entry.path()) {
                 Ok(value) => value,
                 Err(err) => {
-                    eprintln!("[!] {}", err);
+                    log_diagnostic(cli_args, format!("[!] {}", err));
                     continue;
                 }
             };
@@ -401,7 +448,9 @@ fn walk_path(
                 ) {
                     Ok(()) => {}
                     Err(EmitEntryError::ContextIndex(err)) => return (file_count, Err(err)),
-                    Err(EmitEntryError::Output(err)) => eprintln!("[!] {}", err),
+                    Err(EmitEntryError::Output(err)) => {
+                        log_diagnostic(cli_args, format!("[!] {}", err))
+                    }
                 }
             }
 
@@ -410,7 +459,7 @@ fn walk_path(
                 // Clone this since this moves it out of context | We may need to use it later
 
                 if entry_path.to_string_lossy().is_empty() {
-                    eprintln!("The full path is empty.");
+                    log_diagnostic(cli_args, "The full path is empty.");
                     continue;
                 }
 
@@ -419,7 +468,7 @@ fn walk_path(
                 let lnk = match Lnk::try_from(path) {
                     Ok(value) => value,
                     Err(err) => {
-                        eprintln!("[!] {:?}", err);
+                        log_diagnostic(cli_args, format!("[!] {:?}", err));
                         continue;
                     }
                 };
@@ -441,7 +490,7 @@ fn walk_path(
                                         match metadata::FileMetadata::metadata_from_path(target) {
                                             Ok(value) => value,
                                             Err(err) => {
-                                                eprintln!("[!] {}", err);
+                                                log_diagnostic(cli_args, format!("[!] {}", err));
                                                 continue;
                                             }
                                         };
@@ -485,7 +534,7 @@ fn walk_path(
                                             return (file_count, Err(err));
                                         }
                                         Err(EmitEntryError::Output(err)) => {
-                                            eprintln!("[!] {}", err)
+                                            log_diagnostic(cli_args, format!("[!] {}", err))
                                         }
                                     }
                                 }
@@ -493,10 +542,13 @@ fn walk_path(
                         } else {
                             if !roots.iter().any(|b| target.starts_with(b)) {
                                 // If the .lnk points to a directory we add it to the queue to parse it later
-                                println!(
-                                    "[*] Got lnk directory: {} -> {}",
-                                    entry.path().display(),
-                                    target.display()
+                                log_diagnostic(
+                                    cli_args,
+                                    format!(
+                                        "[*] Got lnk directory: {} -> {}",
+                                        entry.path().display(),
+                                        target.display()
+                                    ),
                                 );
                                 queue.push_back(target.to_path_buf());
                             }
@@ -617,11 +669,15 @@ fn walk_path_parallel(
                 .filter_entry(|e| {
                     if e.file_type().is_dir() {
                         let path = e.path();
+                        log_top_level_directory_progress(cli_args, &current_base, path);
 
                         if visited_base_paths.contains(path) {
-                            println!(
-                                "[*] Skipping directory, since already visited: {}",
-                                path.display()
+                            log_diagnostic(
+                                cli_args,
+                                format!(
+                                    "[*] Skipping directory, since already visited: {}",
+                                    path.display()
+                                ),
                             );
                         }
 
@@ -662,6 +718,7 @@ fn walk_path_parallel(
                         &mut file_count,
                         flush_every,
                         &mut queue,
+                        cli_args,
                     ) {
                         Ok(()) => in_flight -= 1,
                         Err(err) => fatal_error = Some(err),
@@ -684,6 +741,7 @@ fn walk_path_parallel(
                                 &mut file_count,
                                 flush_every,
                                 &mut queue,
+                                cli_args,
                             ) {
                                 fatal_error = Some(err);
                             }
@@ -712,6 +770,7 @@ fn walk_path_parallel(
                     &mut file_count,
                     flush_every,
                     &mut queue,
+                    cli_args,
                 ) {
                     Ok(()) => in_flight -= 1,
                     Err(err) => fatal_error = Some(err),
@@ -858,6 +917,7 @@ fn receive_parallel_result(
     file_count: &mut u64,
     flush_every: u64,
     queue: &mut VecDeque<PathBuf>,
+    cli_args: &Args,
 ) -> io::Result<()> {
     let result = result_rx.recv().map_err(|_| {
         io::Error::new(
@@ -878,6 +938,7 @@ fn receive_parallel_result(
         file_count,
         flush_every,
         queue,
+        cli_args,
     )
 }
 
@@ -893,12 +954,13 @@ fn handle_parallel_result(
     file_count: &mut u64,
     flush_every: u64,
     queue: &mut VecDeque<PathBuf>,
+    cli_args: &Args,
 ) -> io::Result<()> {
     pending_results.insert(result.seq, result);
 
     while let Some(result) = pending_results.remove(next_emit_seq) {
         for err in result.errors {
-            eprintln!("[!] {}", err);
+            log_diagnostic(cli_args, format!("[!] {}", err));
         }
 
         for mut entry in result.entries {
@@ -928,15 +990,20 @@ fn handle_parallel_result(
             ) {
                 Ok(()) => {}
                 Err(EmitEntryError::ContextIndex(err)) => return Err(err),
-                Err(EmitEntryError::Output(err)) => eprintln!("[!] {}", err),
+                Err(EmitEntryError::Output(err)) => {
+                    log_diagnostic(cli_args, format!("[!] {}", err))
+                }
             }
         }
 
         for linked_dir in result.linked_dirs {
-            println!(
-                "[*] Got lnk directory: {} -> {}",
-                linked_dir.source.display(),
-                linked_dir.target.display()
+            log_diagnostic(
+                cli_args,
+                format!(
+                    "[*] Got lnk directory: {} -> {}",
+                    linked_dir.source.display(),
+                    linked_dir.target.display()
+                ),
             );
             queue.push_back(linked_dir.target);
         }
@@ -1186,7 +1253,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{emit_entry, validate_output_paths, walk_path, Args};
+    use super::{
+        emit_entry, should_log_diagnostic, should_log_progress, validate_output_paths, walk_path,
+        Args,
+    };
     use clap::Parser;
     use serde_json::Value;
     use std::fs;
@@ -1273,6 +1343,44 @@ mod tests {
             };
 
         assert!(err.to_string().contains("value must be greater than 0"));
+    }
+
+    #[test]
+    fn quiet_flag_accepts_long_and_short_forms() {
+        let long_args = Args::try_parse_from(["DirectorySpider", "-d", "C:\\Logs", "--quiet"])
+            .expect("arguments parse");
+        let short_args = Args::try_parse_from(["DirectorySpider", "-d", "C:\\Logs", "-q"])
+            .expect("arguments parse");
+
+        assert!(long_args.quiet);
+        assert!(short_args.quiet);
+    }
+
+    #[test]
+    fn quiet_flag_suppresses_diagnostics_but_not_progress() {
+        let args = Args::try_parse_from(["DirectorySpider", "-d", "C:\\Logs", "--quiet"])
+            .expect("arguments parse");
+
+        assert!(!should_log_diagnostic(&args));
+        assert!(should_log_progress(&args));
+    }
+
+    #[test]
+    fn top_level_progress_only_matches_immediate_child_directories() {
+        let base = PathBuf::from("C:\\Users");
+
+        assert!(super::is_immediate_child_dir(
+            &base,
+            &PathBuf::from("C:\\Users\\Alice")
+        ));
+        assert!(!super::is_immediate_child_dir(
+            &base,
+            &PathBuf::from("C:\\Users")
+        ));
+        assert!(!super::is_immediate_child_dir(
+            &base,
+            &PathBuf::from("C:\\Users\\Alice\\Documents")
+        ));
     }
 
     #[test]

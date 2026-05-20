@@ -24,6 +24,7 @@ pub struct KeywordScanner {
     context_words: usize,
     max_matches: usize,
     max_context_line_chars: usize,
+    quiet: bool,
 }
 
 impl KeywordScanner {
@@ -85,6 +86,7 @@ impl KeywordScanner {
             context_words: args.context_words,
             max_matches: args.max_matches_per_file,
             max_context_line_chars: args.max_context_line_chars,
+            quiet: args.quiet,
         })
     }
 
@@ -107,12 +109,14 @@ impl KeywordScanner {
         }
 
         if file_size > self.max_scan_size {
-            eprintln!(
-                "[*] Skipping scan, file exceeds --max-scan-size ({} > {}): {}",
-                file_size,
-                self.max_scan_size,
-                path.display()
-            );
+            if !self.quiet {
+                eprintln!(
+                    "[*] Skipping scan, file exceeds --max-scan-size ({} > {}): {}",
+                    file_size,
+                    self.max_scan_size,
+                    path.display()
+                );
+            }
             return ScanResult {
                 keywords: Vec::new(),
                 matches: Vec::new(),
@@ -122,7 +126,9 @@ impl KeywordScanner {
         let bytes = match fs::read(path) {
             Ok(b) => b,
             Err(err) => {
-                eprintln!("[!] scan read {}: {}", path.display(), err);
+                if !self.quiet {
+                    eprintln!("[!] scan read {}: {}", path.display(), err);
+                }
                 return ScanResult {
                     keywords: Vec::new(),
                     matches: Vec::new(),
@@ -525,6 +531,20 @@ mod tests {
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].keyword, "alpha");
         assert_eq!(result.matches[0].r#match, "alpha");
+    }
+
+    #[test]
+    fn quiet_flag_is_carried_into_scanner() {
+        let scanner = scanner_from_args(&[
+            "DirectorySpider",
+            "-d",
+            "C:\\Logs",
+            "--keywords",
+            "alpha",
+            "--quiet",
+        ]);
+
+        assert!(scanner.quiet);
     }
 
     #[test]
